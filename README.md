@@ -261,6 +261,7 @@ Add `-DENABLE_WERROR=ON` to either cmake command to treat warnings as errors (of
 
 - **No seeking support**: Decoder is designed for streaming, not random access
 - **No metadata retrieval**: Vorbis comment tags (title, artist, and similar) are parsed and discarded, not exposed through the API
+- **No concatenated streams**: Only the first logical bitstream is decoded; chained Ogg streams (multiple bitstreams in one file) are not supported
 
 ## License
 
