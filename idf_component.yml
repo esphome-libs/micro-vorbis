@@ -1,0 +1,35 @@
+## IDF Component Manager Manifest File
+name: "micro-vorbis"
+dependencies:
+  idf: ">=5.0"
+description: "Ogg Vorbis audio decoder for ESP32 with integer-only decoding and PSRAM support"
+license: "Apache-2.0 AND BSD-3-Clause"
+maintainers:
+  - Kevin Ahrendt <kevin.ahrendt@openhomefoundation.org>
+version: "0.1.0"
+url: https://github.com/esphome-libs/micro-vorbis
+repository: https://github.com/esphome-libs/micro-vorbis.git
+files:
+  exclude:
+    - ".cache/**"
+    - ".claude/**"
+    - ".github/**"
+    - ".clang-*"
+    - ".clangd"
+    - ".markdownlint.yaml"
+    - ".pre-commit-config.yaml"
+    - "build/**"
+    - "compile_commands.json"
+    - "examples/**"
+    - "host_examples/**"
+    - "tests/**"
+    - "script/**"
+    - "CLAUDE.md"
+    - "lib/micro-ogg-demuxer/.git"
+    - "lib/micro-ogg-demuxer/.github/**"
+    - "lib/micro-ogg-demuxer/.clang-*"
+    - "lib/micro-ogg-demuxer/.gitignore"
+    - "lib/micro-ogg-demuxer/.markdownlint.yaml"
+    - "lib/micro-ogg-demuxer/.pre-commit-config.yaml"
+    - "lib/micro-ogg-demuxer/CLAUDE.md"
+    - "lib/micro-ogg-demuxer/script/**"

@@ -1,0 +1,148 @@
+# Build artifacts
+build/
+build_*/
+*.o
+*.a
+*.so
+*.la
+*.lo
+.libs/
+.deps/
+
+# ESP-IDF specific
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+compile_commands.json
+
+# IDE specific
+.vscode/
+.idea/
+.clangd
+*.swp
+*.swo
+*~
+.cproject
+.project
+.settings/
+.claude/
+
+# OS specific
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+venv/
+env/
+
+# Logs
+*.log
+log/
+
+# Test outputs
+*.wav
+*.ogg
+*.pcm
+test_output/
+
+# Checked-in unit-test fixtures (exception to *.ogg above)
+!tests/data/*.ogg
+
+# Debug symbols
+*.dSYM/
+*.pdb
+
+# Autotools (from upstream experiments)
+Makefile
+Makefile.in
+configure
+config.h
+config.log
+config.status
+config.sub
+config.guess
+configure~
+autom4te.cache/
+aclocal.m4
+compile
+depcomp
+install-sh
+ltmain.sh
+missing
+stamp-h1
+libtool
+m4/
+INSTALL
+package_version
+
+# Documentation
+doc/html/
+doc/latex/
+*.pdf
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+.cache/
+
+# Component registry
+dependencies.lock
+managed_components/
+
+# PlatformIO
+.pio/
+
+# Example build files
+examples/*/build/
+examples/*/sdkconfig
+examples/*/sdkconfig.old
+examples/*/sdkconfig.esp32*
+
+# Benchmark/test data
+*.tar.gz
+*.tar
+*.zip
+test_data/
+benchmark_results/
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+coverage/
+htmlcov/
+
+# Fuzzer outputs
+tests/fuzz/build-libfuzzer/
+tests/fuzz/build-standalone/
+tests/fuzz/build-cov/
+tests/fuzz/corpus_ogg/
+tests/fuzz/corpus_run/
+tests/fuzz/cov-html/
+tests/fuzz/cov.profraw
+tests/fuzz/cov.profdata
+tests/fuzz/crash-*
+tests/fuzz/leak-*
+tests/fuzz/timeout-*
+tests/fuzz/oom-*
+tests/fuzz/seeds_ogg/
+crash-*

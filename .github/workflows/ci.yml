@@ -1,0 +1,139 @@
+---
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pre-commit:
+    name: Pre-commit checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - uses: esphome/pre-commit-action@43cd1109c09c544d97196f7730ee5b2e0cc6d81e # v3.0.1 fork with pinned actions/cache
+
+  lint:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: false
+
+      - name: Initialize library submodules
+        run: git submodule update --init --depth 1 lib/micro-ogg-demuxer
+
+      - name: Install clang-tidy
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-tidy-18
+
+      - name: Run clang-tidy
+        run: ./script/clang-tidy.sh
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: false
+
+      - name: Initialize library submodules
+        run: git submodule update --init --depth 1 lib/micro-ogg-demuxer
+
+      - name: Configure CMake
+        run: cmake -B build -DENABLE_SANITIZERS=ON -DENABLE_WERROR=ON host_examples/vorbis_to_wav
+
+      - name: Build
+        run: cmake --build build
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: false
+
+      - name: Initialize library submodules
+        run: git submodule update --init --depth 1 lib/micro-ogg-demuxer
+
+      - name: Configure unit tests with sanitizers
+        run: cmake -B tests/build -DENABLE_SANITIZERS=ON -DENABLE_WERROR=ON tests
+
+      - name: Build unit tests
+        run: cmake --build tests/build
+
+      - name: Run unit tests
+        run: ctest --test-dir tests/build --output-on-failure
+
+  fuzz:
+    name: Fuzz build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: false
+
+      - name: Initialize library submodules
+        run: git submodule update --init --depth 1 lib/micro-ogg-demuxer
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      # Standalone harness (no libFuzzer runtime needed) under ASan/UBSan.
+      # Guards against harness compile/link regressions and gives the tree a
+      # clang build; deep corpus fuzzing stays a local task (see tests/fuzz).
+      - name: Configure fuzz harness (standalone)
+        run: cmake -B tests/fuzz/build -DFUZZ_USE_LIBFUZZER=OFF -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ tests/fuzz
+
+      - name: Build fuzz harness
+        run: cmake --build tests/fuzz/build
+
+      - name: Run standalone torture battery
+        run: ./tests/fuzz/build/fuzz_ogg_vorbis_decode
+
+  platformio:
+    name: PlatformIO Build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        example: [decode_benchmark]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: false
+
+      - name: Initialize library submodules
+        run: git submodule update --init --depth 1 lib/micro-ogg-demuxer
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Cache PlatformIO
+        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        with:
+          path: |
+            ~/.platformio
+            examples/${{ matrix.example }}/.pio
+          key: pio-${{ matrix.example }}-${{ hashFiles(format('examples/{0}/platformio.ini', matrix.example)) }}
+          restore-keys: |
+            pio-${{ matrix.example }}-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build ${{ matrix.example }}
+        run: pio run -d examples/${{ matrix.example }}

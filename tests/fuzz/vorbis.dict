@@ -1,0 +1,97 @@
+# libFuzzer dictionary for Ogg Vorbis fuzzing.
+# Format: one token per line, quoted C-escaped string.
+#
+# Tokens are deduplicated: libFuzzer ignores duplicate entries, so a byte
+# string that plays several roles (e.g. "\x01" as a channel count, a codebook
+# lookup type, and a continued-packet flag) is listed once, at its first use.
+
+# Ogg page capture pattern (RFC 3533)
+"OggS"
+
+# Vorbis header magic strings (packet-type byte + "vorbis")
+"\x01vorbis"
+"\x03vorbis"
+"\x05vorbis"
+
+# Bare "vorbis" marker (appears after the packet-type byte)
+"vorbis"
+
+# Vorbis version (LE u32, always 0 in the identification header). Doubles as
+# the empty-vendor-string length prefix in the comment header.
+"\x00\x00\x00\x00"
+
+# Common channel counts (u8). "\x01" and "\x02" also serve as codebook lookup
+# types, single-bit-read anchors, and Ogg header_type flags.
+"\x01"
+"\x02"
+"\x06"
+"\x08"
+
+# Common sample rates (little-endian u32, Vorbis is LE)
+# 8000
+"\x40\x1F\x00\x00"
+# 16000
+"\x80\x3E\x00\x00"
+# 22050
+"\x22\x56\x00\x00"
+# 24000
+"\xC0\x5D\x00\x00"
+# 32000
+"\x00\x7D\x00\x00"
+# 44100
+"\x44\xAC\x00\x00"
+# 48000
+"\x80\xBB\x00\x00"
+# 96000
+"\x00\x77\x01\x00"
+
+# Common blocksizes (packed nibble: log2(short) | log2(long) << 4)
+# short=256, long=2048: 0xB8
+"\xB8"
+# short=512, long=2048: 0xB9
+"\xB9"
+# short=256, long=4096: 0xC8
+"\xC8"
+# short=64,  long=8192: 0xD6
+"\xD6"
+# short=1024, long=2048: 0xBA
+"\xBA"
+# short=2048, long=2048: 0xBB
+"\xBB"
+# short=128, long=2048: 0xB7
+"\xB7"
+# short=64, long=4096: 0xC6
+"\xC6"
+
+# Codebook sync pattern "BCV" (0x42 0x43 0x56): appears at start of every codebook
+"BCV"
+
+# Codebook/flag single-byte reads not already covered above:
+# lookup type 0, "ordered"/"sparse" cleared bits, stream_structure_version 0.
+"\x00"
+
+# Setup-header subsection markers (16-bit LE type fields).
+# Floor 0 / Floor 1 / Mapping type 0 all read 0x0000; Floor 1 / Residue 1 read
+# 0x0001; Residue 2 reads 0x0002.
+"\x00\x00"
+"\x01\x00"
+"\x02\x00"
+
+# Comment-header vendor-length prefix shapes (LE u32) that exercise bounds
+# checks. (The empty-vendor 0x00000000 case is the version token above.)
+"\xff\xff\xff\xff"
+"\x00\x00\x00\x80"
+
+# Granule position sentinels (LE u64, appear in every Ogg page header)
+# -1 / unset marker for header pages
+"\xff\xff\xff\xff\xff\xff\xff\xff"
+# zero
+"\x00\x00\x00\x00\x00\x00\x00\x00"
+
+# Single 0xFF byte: page_segments=255 (max lacing table) and a 255-byte
+# continued-segment lacing value.
+"\xff"
+
+# Ogg header_type EOS flag (BOS=0x02 and continued=0x01 are the channel-count
+# tokens above).
+"\x04"

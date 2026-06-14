@@ -1,0 +1,60 @@
+microVorbis
+Copyright 2026 Kevin Ahrendt
+
+This product includes software developed by third parties, listed below.
+Each component retains its original license; see the referenced files for
+the full text. Downstream distributions (source or binary) must preserve
+these notices as required by the respective licenses.
+
+================================================================================
+Tremor (libvorbisidec)
+================================================================================
+
+Location in this repository: src/tremor/
+License:   BSD-3-Clause-style (see src/tremor/COPYING)
+Copyright: (c) 2002, Xiph.org Foundation
+Upstream:  https://gitlab.xiph.org/xiph/tremor
+
+This fork contains modifications by the microVorbis authors, including an
+arena allocator, a lowmem codebook rewrite, PSRAM-aware allocation hooks,
+and Xtensa-specific optimizations. See src/tremor/CHANGES.md for a summary
+of changes relative to upstream.
+
+================================================================================
+libogg (bitstream reader subset)
+================================================================================
+
+Location in this repository: src/tremor/bitwise.c,
+                             src/tremor/ogg/ogg.h,
+                             src/tremor/ogg/os_types.h
+License:   BSD-3-Clause-style (same license; see src/tremor/COPYING)
+Copyright: (c) 1994-2014 Xiph.org Foundation
+Upstream:  https://gitlab.xiph.org/xiph/ogg
+
+Only the decode-side bitstream functions required by Tremor are retained;
+`bitwise.c` has been stripped down accordingly and augmented with an
+optional Xtensa funnel-shift fast path.
+
+================================================================================
+microOggDemuxer
+================================================================================
+
+Location in this repository: lib/micro-ogg-demuxer/ (git submodule)
+License:   Apache License 2.0 (see lib/micro-ogg-demuxer/LICENSE)
+Copyright: (c) 2025 Kevin Ahrendt
+
+================================================================================
+Downstream Obligations
+================================================================================
+
+When redistributing microVorbis in source or binary form (for example, as
+part of firmware built against the ESP-IDF component), you must:
+
+  1. Retain the Xiph.org copyright notice and BSD disclaimer from
+     src/tremor/COPYING in your documentation or equivalent legal/about
+     materials.
+  2. Retain the Apache 2.0 LICENSE text for microVorbis wrapper code and
+     micro-ogg-demuxer.
+  3. Not use the names "Xiph.org Foundation", "Tremor", or the names of
+     contributors to endorse or promote derived products without written
+     permission.

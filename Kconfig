@@ -1,0 +1,169 @@
+menu "microVorbis Decoder"
+
+    config MICRO_VORBIS_COMPONENT
+        bool
+        default y
+
+    menu "Memory Placement"
+
+        choice MICRO_VORBIS_STATE_MEMORY_PREFERENCE
+            prompt "Memory preference for Vorbis decoder state"
+            default MICRO_VORBIS_STATE_PREFER_PSRAM if SPIRAM
+            default MICRO_VORBIS_STATE_INTERNAL_ONLY
+            help
+                Choose memory allocation preference for Vorbis decoder state,
+                floor/residue configuration, and other persistent buffers.
+                Codebook lookup tables are placed separately (see the codebook
+                option below).
+
+                These structures are allocated once and accessed during decoding.
+                Size scales with channel count and block size (the per-channel PCM
+                history dominates): roughly 10KB for a mono or low-rate stream,
+                ~40KB for 48kHz stereo, and more for multichannel.
+
+                - Prefer PSRAM: Saves internal RAM, slight performance penalty
+                - Prefer internal: Better performance, uses precious internal RAM
+                - PSRAM only: Fails if PSRAM unavailable
+                - Internal only: Never uses PSRAM
+
+            config MICRO_VORBIS_STATE_PREFER_PSRAM
+                bool "Prefer PSRAM, fall back to internal RAM"
+                depends on SPIRAM
+                help
+                    Try to allocate from PSRAM first. If PSRAM allocation fails or
+                    is unavailable, fall back to internal RAM.
+
+                    Recommended for most use cases to conserve internal RAM.
+
+            config MICRO_VORBIS_STATE_PREFER_INTERNAL
+                bool "Prefer internal RAM, fall back to PSRAM"
+                depends on SPIRAM
+                help
+                    Try to allocate from internal RAM first. If internal RAM
+                    allocation fails, fall back to PSRAM.
+
+                    May provide slightly better performance at the cost of using
+                    more internal RAM.
+
+            config MICRO_VORBIS_STATE_PSRAM_ONLY
+                bool "PSRAM only (fail if unavailable)"
+                depends on SPIRAM
+                help
+                    Only allocate from PSRAM. If PSRAM is not available or allocation
+                    fails, decode() will fail with
+                    OGG_VORBIS_DECODER_ERROR_ALLOCATION_FAILED.
+
+            config MICRO_VORBIS_STATE_INTERNAL_ONLY
+                bool "Internal RAM only"
+                help
+                    Never use PSRAM for state allocation. Only use internal RAM.
+                    Uses roughly 10KB (mono/low-rate) to ~40KB (48kHz stereo) of
+                    internal RAM per decoder instance, more for multichannel.
+
+        endchoice
+
+        choice MICRO_VORBIS_OGG_DECODER_MEMORY_PREFERENCE
+            prompt "Memory preference for OggVorbisDecoder buffers"
+            default MICRO_VORBIS_OGG_DECODER_PREFER_PSRAM if SPIRAM
+            default MICRO_VORBIS_OGG_DECODER_INTERNAL_ONLY
+            help
+                Choose memory allocation preference for the OggVorbisDecoder internal
+                buffers. This affects the Ogg demuxer state and packet assembly buffers.
+
+                The Ogg demuxer maintains state for stream synchronization and packet
+                reassembly, which can grow to several KB depending on file structure.
+
+                - Prefer PSRAM: Conserves internal RAM, uses PSRAM when available
+                - Prefer internal: Better performance, uses internal RAM first
+                - PSRAM only: Fails if PSRAM unavailable
+                - Internal only: Never uses PSRAM
+
+            config MICRO_VORBIS_OGG_DECODER_PREFER_PSRAM
+                bool "Prefer PSRAM, fall back to internal RAM"
+                depends on SPIRAM
+                help
+                    Try to allocate Ogg decoder buffers from PSRAM first. If PSRAM
+                    allocation fails or is unavailable, fall back to internal RAM.
+
+                    Recommended for most use cases to conserve internal RAM.
+
+            config MICRO_VORBIS_OGG_DECODER_PREFER_INTERNAL
+                bool "Prefer internal RAM, fall back to PSRAM"
+                depends on SPIRAM
+                help
+                    Try to allocate Ogg decoder buffers from internal RAM first.
+                    If internal RAM allocation fails, fall back to PSRAM.
+
+                    May provide slightly better performance for streaming decode.
+
+            config MICRO_VORBIS_OGG_DECODER_PSRAM_ONLY
+                bool "PSRAM only (fail if unavailable)"
+                depends on SPIRAM
+                help
+                    Only allocate Ogg decoder buffers from PSRAM. If PSRAM is not
+                    available or allocation fails, the decoder will fail to initialize.
+
+            config MICRO_VORBIS_OGG_DECODER_INTERNAL_ONLY
+                bool "Internal RAM only"
+                help
+                    Never use PSRAM for Ogg decoder buffers. Only use internal RAM.
+
+        endchoice
+
+        choice MICRO_VORBIS_CODEBOOK_MEMORY_PREFERENCE
+            prompt "Memory preference for codebook lookup tables"
+            default MICRO_VORBIS_CODEBOOK_PREFER_INTERNAL if SPIRAM
+            default MICRO_VORBIS_CODEBOOK_INTERNAL_ONLY
+            help
+                Choose memory allocation preference for Vorbis codebook lookup tables
+                (compact Huffman decode trees and quantized value arrays).
+
+                These tables are accessed with random-access patterns in the innermost
+                decode loop for every audio frame, making them highly sensitive to
+                memory latency. Total codebook size is typically 5-20KB per decoder
+                instance with the lowmem codebook approach.
+
+                - Prefer internal: Best decode performance (recommended)
+                - Prefer PSRAM: Saves internal RAM, significant decode performance penalty
+                - PSRAM only: Fails if PSRAM unavailable
+                - Internal only: Never uses PSRAM
+
+            config MICRO_VORBIS_CODEBOOK_PREFER_INTERNAL
+                bool "Prefer internal RAM, fall back to PSRAM (Recommended)"
+                depends on SPIRAM
+                help
+                    Try to allocate codebook tables from internal RAM first. If internal
+                    RAM allocation fails, fall back to PSRAM.
+
+                    Recommended for best decode performance. Codebook lookups are
+                    random-access and dominate the decode hot path.
+
+            config MICRO_VORBIS_CODEBOOK_PREFER_PSRAM
+                bool "Prefer PSRAM, fall back to internal RAM"
+                depends on SPIRAM
+                help
+                    Try to allocate codebook tables from PSRAM first. If PSRAM allocation
+                    fails or is unavailable, fall back to internal RAM.
+
+                    Saves internal RAM but can reduce decode performance due to higher
+                    PSRAM latency on random-access patterns.
+
+            config MICRO_VORBIS_CODEBOOK_PSRAM_ONLY
+                bool "PSRAM only (fail if unavailable)"
+                depends on SPIRAM
+                help
+                    Only allocate codebook tables from PSRAM. If PSRAM is not available
+                    or allocation fails, codebook initialization will fail.
+
+            config MICRO_VORBIS_CODEBOOK_INTERNAL_ONLY
+                bool "Internal RAM only"
+                help
+                    Never use PSRAM for codebook tables. Only use internal RAM.
+                    Uses approximately 5-20KB of internal RAM per decoder instance
+                    depending on the Vorbis file.
+
+        endchoice
+
+    endmenu
+
+endmenu
