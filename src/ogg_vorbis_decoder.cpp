@@ -105,6 +105,35 @@ static inline int16_t round_to_16(ogg_int32_t val) {
                       TREMOR_PCM_SHIFT);
 }
 
+// Apply op(i) to every sample index in [0, num_samples), four indices per loop
+// iteration. The four calls in a step are independent, so the compiler can pipeline
+// the per-sample work (the round/clip or downmix chain) across lanes; the tail loop
+// covers a count that is not a multiple of four. op is a small functor that inlines
+// fully at -O2, so this adds no call overhead - it just hoists the 4x-unroll
+// scaffolding that the PCM conversion paths below would otherwise each repeat inline.
+template <typename Op>
+static inline void unrolled_for(size_t num_samples, Op op) {
+    size_t i = 0;
+    for (; i + 3 < num_samples; i += 4) {
+        op(i);
+        op(i + 1);
+        op(i + 2);
+        op(i + 3);
+    }
+    for (; i < num_samples; i++) {
+        op(i);
+    }
+}
+
+// Convert one planar source channel to int16 and scatter it into the interleaved
+// output at output channel ch (stride = out_channels). Shared by the raw
+// channel-selection and native-copy paths, which differ only in how src and ch
+// are chosen.
+static inline void emit_plane(const ogg_int32_t* src, int16_t* dst, size_t num_samples,
+                              uint8_t out_channels, uint8_t ch) {
+    unrolled_for(num_samples, [&](size_t i) { dst[i * out_channels + ch] = round_to_16(src[i]); });
+}
+
 // Smart-downmix coefficients. The fold follows ITU-R BS.775 (also the ATSC A/52
 // Lo/Ro defaults): front channels weighted 1.0, center and surround channels
 // 0.7071 (-3 dB), LFE dropped, and the whole equation scaled by a per-layout
@@ -826,80 +855,32 @@ OggVorbisResult OggVorbisDecoder::output_pcm(uint8_t* output, size_t output_size
                     pcm_output[i * output_channels + ch] = 0;
                 }
             } else {
-                const ogg_int32_t* src = pcm[plane];
-                size_t i = 0;
-                for (; i + 3 < num_samples; i += 4) {
-                    pcm_output[i * output_channels + ch] = round_to_16(src[i]);
-                    pcm_output[(i + 1) * output_channels + ch] = round_to_16(src[i + 1]);
-                    pcm_output[(i + 2) * output_channels + ch] = round_to_16(src[i + 2]);
-                    pcm_output[(i + 3) * output_channels + ch] = round_to_16(src[i + 3]);
-                }
-                for (; i < num_samples; i++) {
-                    pcm_output[i * output_channels + ch] = round_to_16(src[i]);
-                }
+                emit_plane(pcm[plane], pcm_output, num_samples, output_channels, ch);
             }
         }
     } else if (output_channels == stream_channels) {
+        // Native copy: the output layout matches the stream, so each output channel is
+        // one source plane at unity.
         for (uint8_t ch = 0; ch < output_channels; ch++) {
-            const ogg_int32_t* src = pcm[ch];
-            size_t i = 0;
-            for (; i + 3 < num_samples; i += 4) {
-                pcm_output[i * output_channels + ch] = round_to_16(src[i]);
-                pcm_output[(i + 1) * output_channels + ch] = round_to_16(src[i + 1]);
-                pcm_output[(i + 2) * output_channels + ch] = round_to_16(src[i + 2]);
-                pcm_output[(i + 3) * output_channels + ch] = round_to_16(src[i + 3]);
-            }
-            for (; i < num_samples; i++) {
-                pcm_output[i * output_channels + ch] = round_to_16(src[i]);
-            }
+            emit_plane(pcm[ch], pcm_output, num_samples, output_channels, ch);
         }
+    } else if (output_channels == 1) {
+        // Downmix to mono: the half-sum of the full-precision stereo fold (see
+        // downmix_stereo). The +1 before the >>1 (the averaging divide) rounds to nearest.
+        unrolled_for(num_samples, [&](size_t i) {
+            ogg_int32_t lo = 0, ro = 0;
+            downmix_stereo(pcm, i, stream_channels, lo, ro);
+            pcm_output[i] = clip_to_16((lo + ro + 1) >> 1);
+        });
     } else {
-        // Channel conversion. output_channels is guaranteed to be 1 (mono) or 2 (stereo).
-        // Compute a full-precision stereo (lo, ro) pair per the Vorbis channel order; mono
-        // is the half-sum of that pair.
-        if (output_channels == 1) {
-            size_t i = 0;
-            for (; i + 3 < num_samples; i += 4) {
-                ogg_int32_t lo0 = 0, ro0 = 0, lo1 = 0, ro1 = 0, lo2 = 0, ro2 = 0, lo3 = 0, ro3 = 0;
-                downmix_stereo(pcm, i, stream_channels, lo0, ro0);
-                downmix_stereo(pcm, i + 1, stream_channels, lo1, ro1);
-                downmix_stereo(pcm, i + 2, stream_channels, lo2, ro2);
-                downmix_stereo(pcm, i + 3, stream_channels, lo3, ro3);
-                // Shift is division by 2 for averaging the channels and add 1 for rounding.
-                pcm_output[i] = clip_to_16((lo0 + ro0 + 1) >> 1);
-                pcm_output[i + 1] = clip_to_16((lo1 + ro1 + 1) >> 1);
-                pcm_output[i + 2] = clip_to_16((lo2 + ro2 + 1) >> 1);
-                pcm_output[i + 3] = clip_to_16((lo3 + ro3 + 1) >> 1);
-            }
-            for (; i < num_samples; i++) {
-                ogg_int32_t lo = 0, ro = 0;
-                downmix_stereo(pcm, i, stream_channels, lo, ro);
-                pcm_output[i] = clip_to_16((lo + ro + 1) >> 1);
-            }
-        } else {
-            size_t i = 0;
-            for (; i + 3 < num_samples; i += 4) {
-                ogg_int32_t lo0 = 0, ro0 = 0, lo1 = 0, ro1 = 0, lo2 = 0, ro2 = 0, lo3 = 0, ro3 = 0;
-                downmix_stereo(pcm, i, stream_channels, lo0, ro0);
-                downmix_stereo(pcm, i + 1, stream_channels, lo1, ro1);
-                downmix_stereo(pcm, i + 2, stream_channels, lo2, ro2);
-                downmix_stereo(pcm, i + 3, stream_channels, lo3, ro3);
-                pcm_output[i * 2] = clip_to_16(lo0);
-                pcm_output[i * 2 + 1] = clip_to_16(ro0);
-                pcm_output[(i + 1) * 2] = clip_to_16(lo1);
-                pcm_output[(i + 1) * 2 + 1] = clip_to_16(ro1);
-                pcm_output[(i + 2) * 2] = clip_to_16(lo2);
-                pcm_output[(i + 2) * 2 + 1] = clip_to_16(ro2);
-                pcm_output[(i + 3) * 2] = clip_to_16(lo3);
-                pcm_output[(i + 3) * 2 + 1] = clip_to_16(ro3);
-            }
-            for (; i < num_samples; i++) {
-                ogg_int32_t lo = 0, ro = 0;
-                downmix_stereo(pcm, i, stream_channels, lo, ro);
-                pcm_output[i * 2] = clip_to_16(lo);
-                pcm_output[i * 2 + 1] = clip_to_16(ro);
-            }
-        }
+        // Downmix to stereo: write the (lo, ro) fold directly. output_channels is
+        // guaranteed to be 2 here.
+        unrolled_for(num_samples, [&](size_t i) {
+            ogg_int32_t lo = 0, ro = 0;
+            downmix_stereo(pcm, i, stream_channels, lo, ro);
+            pcm_output[i * 2] = clip_to_16(lo);
+            pcm_output[i * 2 + 1] = clip_to_16(ro);
+        });
     }
 
     // Tell tremor we consumed all available samples
