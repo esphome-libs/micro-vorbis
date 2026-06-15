@@ -554,7 +554,7 @@ OggVorbisResult OggVorbisDecoder::handle_identification_packet(const uint8_t* pa
 
     // Vorbis I spec Section 4.2.2: Granule position of identification header page must be 0.
     // Accept the -1 "no position" sentinel as well, matching the comment and setup handlers.
-    if (granule_pos != 0 && (uint64_t)granule_pos != INVALID_GRANULE_POSITION) {
+    if (granule_pos != 0 && static_cast<uint64_t>(granule_pos) != INVALID_GRANULE_POSITION) {
         return OGG_VORBIS_DECODER_ERROR_INPUT_INVALID;
     }
 
@@ -644,7 +644,7 @@ OggVorbisResult OggVorbisDecoder::stream_vorbis_comment(const uint8_t* input, si
     // Vorbis I spec Section 4.2.2: Granule position of comment header page must be 0
     if (parse_state.packet.is_last_on_page) {
         int64_t gp = parse_state.packet.granule_position;
-        if (gp != 0 && (uint64_t)gp != INVALID_GRANULE_POSITION) {
+        if (gp != 0 && static_cast<uint64_t>(gp) != INVALID_GRANULE_POSITION) {
             return OGG_VORBIS_DECODER_ERROR_INPUT_INVALID;
         }
     }
@@ -681,7 +681,7 @@ OggVorbisResult OggVorbisDecoder::handle_setup_packet(const uint8_t* packet_data
     }
 
     // Vorbis I spec Section 4.2.2: Granule position of setup header page must be 0
-    if (granule_pos != 0 && (uint64_t)granule_pos != INVALID_GRANULE_POSITION) {
+    if (granule_pos != 0 && static_cast<uint64_t>(granule_pos) != INVALID_GRANULE_POSITION) {
         return OGG_VORBIS_DECODER_ERROR_INPUT_INVALID;
     }
 
