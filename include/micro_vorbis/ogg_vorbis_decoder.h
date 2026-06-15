@@ -297,6 +297,10 @@ public:
     /// @brief Destroy the decoder and free resources
     ~OggVorbisDecoder();
 
+    // Non-copyable and non-movable: the decoder pins Tremor's decode state (vorbis_info/
+    // vorbis_dsp_state/vorbis_block), which holds interior pointers back into itself
+    // (vd.vi, vb.vd, arena and pcm buffers). That state cannot be relocated, so the
+    // decoder is a fixed-in-place resource; construct it once and reset() between streams.
     OggVorbisDecoder(const OggVorbisDecoder&) = delete;
     OggVorbisDecoder& operator=(const OggVorbisDecoder&) = delete;
     OggVorbisDecoder(OggVorbisDecoder&&) = delete;
