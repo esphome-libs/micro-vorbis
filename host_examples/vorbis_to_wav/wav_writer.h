@@ -16,8 +16,7 @@
  * Supports PCM audio in standard RIFF/WAVE format
  */
 
-#ifndef WAV_WRITER_H
-#define WAV_WRITER_H
+#pragma once
 
 #include <cstdint>
 #include <cstdio>
@@ -95,5 +94,3 @@ private:
     uint32_t channel_mask_;
     uint64_t samples_written_;
 };
-
-#endif  // WAV_WRITER_H
