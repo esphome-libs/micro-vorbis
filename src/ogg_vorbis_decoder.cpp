@@ -63,6 +63,38 @@ struct OggVorbisDecoder::TremorState {
     bool block_initialized{false};
 };
 
+#ifdef ESP_PLATFORM
+// Preference-aware allocators for the Ogg demuxer, configurable via Kconfig
+// (MICRO_VORBIS_OGG_DECODER_MEMORY_PREFERENCE). Every policy is just an ordered
+// (primary, fallback) pair of capability masks. The "*_ONLY" policies repeat the
+// same mask so heap_caps_*_prefer can never spill into the other memory, which
+// lets alloc and realloc share one unconditional _prefer call.
+constexpr uint32_t OGG_CAP_PSRAM = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+constexpr uint32_t OGG_CAP_INTERNAL = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
+
+#if defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PREFER_INTERNAL)
+constexpr uint32_t OGG_ALLOC_PRIMARY = OGG_CAP_INTERNAL, OGG_ALLOC_FALLBACK = OGG_CAP_PSRAM;
+#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PSRAM_ONLY)
+constexpr uint32_t OGG_ALLOC_PRIMARY = OGG_CAP_PSRAM, OGG_ALLOC_FALLBACK = OGG_CAP_PSRAM;
+#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_INTERNAL_ONLY)
+constexpr uint32_t OGG_ALLOC_PRIMARY = OGG_CAP_INTERNAL, OGG_ALLOC_FALLBACK = OGG_CAP_INTERNAL;
+#else  // PREFER_PSRAM and the default/no-SPIRAM case: prefer PSRAM, fall back to internal RAM.
+constexpr uint32_t OGG_ALLOC_PRIMARY = OGG_CAP_PSRAM, OGG_ALLOC_FALLBACK = OGG_CAP_INTERNAL;
+#endif
+
+static void* ogg_demuxer_alloc(size_t size) {
+    return heap_caps_malloc_prefer(size, 2, OGG_ALLOC_PRIMARY, OGG_ALLOC_FALLBACK);
+}
+
+static void* ogg_demuxer_realloc(void* ptr, size_t size) {
+    return heap_caps_realloc_prefer(ptr, size, 2, OGG_ALLOC_PRIMARY, OGG_ALLOC_FALLBACK);
+}
+
+static void ogg_demuxer_free(void* ptr) {
+    heap_caps_free(ptr);
+}
+#endif  // ESP_PLATFORM
+
 // Convert micro_ogg::OggPacket metadata to an ogg_packet for tremor API calls
 static ogg_packet make_ogg_packet(const uint8_t* data, size_t length, bool is_bos, bool is_eos,
                                   int64_t granule_pos, int64_t packetno) {
@@ -381,49 +413,11 @@ OggVorbisResult OggVorbisDecoder::decode(const uint8_t* input, size_t input_len,
         ogg_config.enable_crc = this->enable_crc_;
 
 #ifdef ESP_PLATFORM
-        // Use preference-aware allocators on ESP32 (configurable via Kconfig)
-        struct AllocFns {
-            static void* alloc_fn(size_t size) {
-#if defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PREFER_PSRAM)
-                return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PREFER_INTERNAL)
-                return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
-                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PSRAM_ONLY)
-                return heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_INTERNAL_ONLY)
-                return heap_caps_malloc(size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#else
-                // Default: prefer PSRAM with fallback to internal RAM
-                return heap_caps_malloc_prefer(size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                               MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#endif
-            }
-            static void* realloc_fn(void* ptr, size_t size) {
-#if defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PREFER_PSRAM)
-                return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PREFER_INTERNAL)
-                return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT,
-                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_PSRAM_ONLY)
-                return heap_caps_realloc(ptr, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-#elif defined(CONFIG_MICRO_VORBIS_OGG_DECODER_INTERNAL_ONLY)
-                return heap_caps_realloc(ptr, size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#else
-                // Default: prefer PSRAM with fallback to internal RAM
-                return heap_caps_realloc_prefer(ptr, size, 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
-                                                MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-#endif
-            }
-            static void free_fn(void* ptr) {
-                heap_caps_free(ptr);
-            }
-        };
-        ogg_config.alloc = AllocFns::alloc_fn;
-        ogg_config.realloc = AllocFns::realloc_fn;
-        ogg_config.free = AllocFns::free_fn;
+        // Use preference-aware allocators on ESP32 (configurable via Kconfig).
+        // Placement policy is resolved once in the ogg_demuxer_* helpers above.
+        ogg_config.alloc = ogg_demuxer_alloc;
+        ogg_config.realloc = ogg_demuxer_realloc;
+        ogg_config.free = ogg_demuxer_free;
 #endif
 
         // Honor the documented contract: report OOM as ERROR_ALLOCATION_FAILED rather
