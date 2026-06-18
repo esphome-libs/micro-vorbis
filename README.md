@@ -255,7 +255,7 @@ cmake -DENABLE_SANITIZERS=ON -B build && cmake --build build
 ./build/vorbis_to_wav input.ogg output.wav
 ```
 
-Add `-DENABLE_WERROR=ON` to either cmake command to treat warnings as errors (off by default).
+Add `-DENABLE_WERROR=ON` to either cmake command to treat warnings as errors (off by default). A libFuzzer harness lives in [tests/fuzz/](tests/fuzz/) for fuzzing the streaming decoder; see its README for build and run instructions.
 
 ## Known Limitations
 
