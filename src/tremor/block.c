@@ -212,6 +212,17 @@ int vorbis_block_clear(vorbis_block *vb){
    next to the arena itself (which is dominated by residue decodemaps). */
 #define DSP_ARENA_SAFETY 256
 
+/* Ceiling on the DSP setup arena. The arena is addressed with `long` offsets
+   (setup_arena_used/_capacity) and handed to a single _ogg_malloc, so on the
+   ILP32 target (ESP32, 32-bit long) it can never exceed 2^31-1 bytes. A crafted
+   header - many modes/submaps all pointing at one residue whose decodemap is
+   hundreds of MB (res012.c) - can drive _vorbis_dsp_arena_compute_size's mirror
+   total past that. Summed into a 32-bit long it would wrap to a small value,
+   _ogg_malloc would then succeed undersized, and res0_look's unchecked arena
+   allocations would scribble past the buffer. The total is computed in 64 bits
+   and any stream over this cap is rejected before the malloc. */
+#define DSP_ARENA_MAX_BYTES 0x7fffffffLL
+
 /* Compute the size of the DSP setup arena from codec_setup_info. Mirrors the
    top-level allocations in _vds_init and, through the per-backend arena_size
    vtable entries, every mode/floor/residue lookup that mapping0_look builds.
@@ -224,11 +235,14 @@ int vorbis_block_clear(vorbis_block *vb){
    mask is fixed before the arena is sized, dropped channels are never allocated
    at all, so there is nothing to free later and the whole DSP state collapses to
    this single allocation. */
-static long _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsigned char *keep){
+/* Returns the mirrored arena size in 64-bit so a maliciously large mode/submap
+   fan-out (each per-mode term is a valid long, but up to 64 modes * 16 submaps
+   can sum past 2^31) cannot wrap; the caller enforces DSP_ARENA_MAX_BYTES. */
+static ogg_int64_t _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsigned char *keep){
   vorbis_info *vi=v->vi;
   codec_setup_info *ci=(codec_setup_info *)vi->codec_setup;
   int channels=vi->channels;
-  long size=0;
+  ogg_int64_t size=0;
   int i;
 
   size+=_vorbis_arena_round(sizeof(private_state));                 /* backend_state */
@@ -257,7 +271,7 @@ static long _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsigned ch
 
 static int _vds_init(vorbis_dsp_state *v,vorbis_info *vi,const unsigned char *keep){
   int i;
-  long arena_size;
+  ogg_int64_t arena_size;
   codec_setup_info *ci=(codec_setup_info *)vi->codec_setup;
   private_state *b=NULL;
 
@@ -276,10 +290,17 @@ static int _vds_init(vorbis_dsp_state *v,vorbis_info *vi,const unsigned char *ke
      is fixed here, before sizing, so dropped channels' history buffers are never
      allocated rather than allocated-then-freed. */
   arena_size=_vorbis_dsp_arena_compute_size(v,keep);
-  v->setup_arena_data=_ogg_malloc(arena_size+DSP_ARENA_SAFETY);
+  /* Reject a header whose mirrored arena can't fit a `long` (see
+     DSP_ARENA_MAX_BYTES). Leaving room for DSP_ARENA_SAFETY keeps the malloc
+     argument and setup_arena_capacity within a positive long on the 32-bit
+     target. A genuinely large but representable arena still fails cleanly at the
+     _ogg_malloc NULL check below. */
+  if(arena_size<0 || arena_size>DSP_ARENA_MAX_BYTES-DSP_ARENA_SAFETY)
+    return -1;
+  v->setup_arena_data=_ogg_malloc((long)arena_size+DSP_ARENA_SAFETY);
   if(!v->setup_arena_data)
     return -1;
-  v->setup_arena_capacity=arena_size+DSP_ARENA_SAFETY;
+  v->setup_arena_capacity=(long)arena_size+DSP_ARENA_SAFETY;
   v->setup_arena_used=0;
 
   b=(private_state *)(v->backend_state=_vorbis_setup_calloc(v,1,sizeof(*b)));

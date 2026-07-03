@@ -252,7 +252,16 @@ and `a629068d`, May 2026):
     recurses into the floor/residue `arena_size` callbacks per submap. The mirror
     is exact: the computed size equals the arena's final used watermark. A
     256-byte `DSP_ARENA_SAFETY` pad is added as insurance against an
-    overlooked site or platform `sizeof` drift.
+    overlooked site or platform `sizeof` drift. `_vorbis_dsp_arena_compute_size`
+    accumulates and returns the total in `ogg_int64_t`: a crafted header can
+    point up to 64 modes * 16 submaps at one residue whose decodemap is hundreds
+    of MB (`res012.c`), and although each per-mode term is a valid `long`, the
+    sum can exceed `2^31` and would wrap a 32-bit `long` on the ESP32 target to a
+    small value. `_ogg_malloc` would then succeed undersized and `res0_look`'s
+    unchecked arena allocations would scribble past the buffer. `_vds_init`
+    rejects any header whose 64-bit total exceeds `DSP_ARENA_MAX_BYTES`
+    (`2^31-1`, the largest arena a `long` offset can address) via the existing
+    `-1` init-failure path before the allocation.
   - **Per-look freeing is gone**: the backend `free_look` hooks are now no-ops
     and `vorbis_dsp_clear` releases the entire DSP state in a single
     `_ogg_free(setup_arena_data)`. `_vds_init` returns `-1` if the one arena
