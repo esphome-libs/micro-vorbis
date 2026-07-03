@@ -154,11 +154,26 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
         if(pw>max_partwords_2) max_partwords_2=pw;
       }
     }
-    /* _01inverse: outer array + per-ch inner arrays */
+    /* _01inverse: outer array + per-ch inner arrays. Its `end` cap is pcmend/2
+       (channel-independent) and it allocates `ch` inner arrays per submap, so
+       summed over all submaps the inner arrays total channels*max_partwords_01
+       (the submaps partition the channels) - already covered above. */
     size += channels * (long)sizeof(int **);
     size += channels * max_partwords_01 * (long)sizeof(int *);
-    /* res2: separate partword array */
-    size += max_partwords_2 * (long)sizeof(int *);
+    /* res2: one partword array per submap. mapping0_inverse calls the residue
+       inverse once per submap (mapping0.c) and res2_inverse allocates its
+       partword array unconditionally (res012.c); the block arena is reset only
+       between packets, so every submap's array is live at once. Unlike res0/1,
+       res2's array size is channel-independent when info->end is the binding cap
+       (each submap then allocates the full max_partwords_2, not a ch-scaled
+       share), so a single reservation undercounts by the submap count. A submap
+       must carry >=1 channel to allocate (ch==0 -> n<=0 -> no alloc) and the
+       submaps partition the channels, so at most min(channels,submaps) res2
+       arrays coexist; submaps is a 4-bit field (<=16). Reserve that many. */
+    {
+      long max_res2_submaps = channels < 16 ? channels : 16;
+      size += max_res2_submaps * max_partwords_2 * (long)sizeof(int *);
+    }
   }
 
   /* mapping0 ARENA_STACK allocations (4 arrays of channels pointers/ints) */
@@ -177,8 +192,11 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
        channels   pcm data buffers         (synthesis.c)
        4          mapping bundles          (mapping0.c: pcm/zero/nonzero/floormemo)
        channels   floor memos              (floor0/1 inverse1)
-       channels   residue inner partwords  (res012.c, summed over submaps)
-       channels   residue outer partwords  (res012.c, per non-empty submap)
+       channels   residue inner arrays     (res012.c: res0/1 per-channel inner
+                                             arrays, summed over submaps)
+       channels   residue outer arrays     (res012.c: res0/1 outer array or res2
+                                             partword array - one per submap, and
+                                             the submaps partition the channels)
      The slack has to scale with channels (Vorbis allows up to 255): the
      decode path dereferences _vorbis_block_alloc's NULL return unchecked,
      so an undersized arena is a crash, not a clean failure. */
