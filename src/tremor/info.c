@@ -111,9 +111,17 @@ static int _vorbis_unpack_info(vorbis_info *vi,oggpack_buffer *opb){
   vi->bitrate_nominal=(ogg_int32_t)oggpack_read(opb,32);
   vi->bitrate_lower=(ogg_int32_t)oggpack_read(opb,32);
 
-  ci->blocksizes[0]=1<<oggpack_read(opb,4);
-  ci->blocksizes[1]=1<<oggpack_read(opb,4);
-  
+  {
+    /* Reject a truncated header before shifting: oggpack_read returns the -1
+       EOP sentinel on overrun, and 1<<-1 is undefined. Mirrors floor1.c's
+       rangebits guard; the EOP check below only fires after the shift. */
+    int bs0=oggpack_read(opb,4);
+    int bs1=oggpack_read(opb,4);
+    if(bs0<0||bs1<0)goto err_out;
+    ci->blocksizes[0]=1<<bs0;
+    ci->blocksizes[1]=1<<bs1;
+  }
+
   if(vi->rate<1)goto err_out;
   if(vi->channels<1)goto err_out;
   if(ci->blocksizes[0]<64)goto err_out; 

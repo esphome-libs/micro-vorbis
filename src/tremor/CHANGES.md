@@ -468,6 +468,17 @@ compiler-defined `#ifdef __XTENSA__`.
   related `q_pack * dim > 32` unpack-time rejection is described in the
   codebook hardening section.
 
+- **Negative shift exponent from a truncated id header** (`info.c`):
+  `_vorbis_unpack_info` set `ci->blocksizes[i] = 1 << oggpack_read(opb,4)`
+  directly. On a truncated identification packet `oggpack_read` returns its
+  `-1` end-of-packet sentinel, making `1 << -1` a shift by a negative count
+  (UB; UBSan `shift-exponent-negative`). The two reads are now taken into
+  locals and rejected if negative before the shift, mirroring the
+  `rangebits` guard in `floor1.c`; the existing EOP check only fires after
+  the shift. Reachable only through the exported `vorbis_synthesis_headerin`
+  API. The C++ wrapper's 30-byte identification-header minimum keeps every
+  in-tree path away from it.
+
 - **Out-of-bounds value-array index from a sparse codebook**
   (`codebook.c`): the lowmem `_make_words` carries only the
   overpopulated-tree check. Master's `sharedbook.c` also rejected an
