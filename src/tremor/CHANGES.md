@@ -159,6 +159,19 @@ and `a629068d`, May 2026):
   rejects referenced codebooks with no value mapping (`dec_type == 0`,
   i.e. maptype-0 books, unusable by `vorbis_book_decodev_set`) or
   `dim < 1`, and rejects `numbooks < 1`.
+- **Tree-walk fall-off forces end-of-packet** (`codebook.c`): when
+  `decode_packed_entry_number` chases a codebook's decode tree through all
+  `dec_maxlength` bits without reaching a leaf, it now sets the overrun
+  sentinel (`oggpack_seteop`) rather than relying on the trailing
+  `oggpack_adv(b, read+1)` to trip it. That advance's overflow check is
+  byte-granular, so slack in the final partial byte could leave end-of-packet
+  unset and let the `0xffffffff` entry reach `decode_map_apply`, which would
+  then dequantize garbage (`dec_type 1`) or read `q_val` out of bounds
+  (`dec_type 2`, when `quantvals` is not a power of two). Only a one-used-entry
+  book reaches this path: fuller trees are complete or rejected by the
+  underpopulated-tree check in `_make_words`, and a valid stream only emits
+  that book's single codeword, so it never falls off. The `dec_type 3` index
+  bound is kept as a secondary guard.
 
 ### Performance changes relative to the lowmem branch
 

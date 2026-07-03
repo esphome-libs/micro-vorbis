@@ -49,6 +49,16 @@ static inline int oggpack_eop(oggpack_buffer *b){
   return (b->ptr == NULL) ? -1 : 0;
 }
 
+/* Force the end-of-packet (overrun) sentinel, mirroring the state that
+   bitwise.c's oggpack_read/oggpack_adv set on overflow. Used where the
+   decoder must signal a corrupt packet but no read actually overran the
+   buffer, so oggpack_eop would otherwise report "no overrun". */
+static inline void oggpack_seteop(oggpack_buffer *b){
+  b->ptr=NULL;
+  b->endbyte=b->storage;
+  b->endbit=1;
+}
+
 /**** pack/unpack helpers ******************************************/
 int _ilog(unsigned int v){
   int ret=0;
@@ -736,7 +746,17 @@ static inline ogg_uint32_t decode_packed_entry_number(codebook *book,
     oggpack_adv(b,i+1);
     return chase;
   }
-  oggpack_adv(b,read+1);
+  /* The walk consumed all dec_maxlength bits without reaching a leaf. A
+     valid stream never gets here: a book's tree is fully populated, and the
+     lone exception (a one-used-entry book, exempted from the underpopulated
+     reject in _make_words) only ever sees its single codeword. So this is
+     corrupt input. The original oggpack_adv(b,read+1) was meant to overrun
+     and set EOP, but the overflow check is byte-granular -- slack in the
+     final partial byte leaves EOP unset, letting the 0xffffffff sentinel
+     reach decode_map_apply (bounded garbage for dec_type 1, an out-of-range
+     q_val index for dec_type 2). Force EOP so every caller's eop check
+     rejects the vector. */
+  oggpack_seteop(b);
   return(-1);
 }
 
@@ -823,10 +843,11 @@ static inline int decode_map_apply(const decode_map_ctx *ctx,
   }
   case 3:{
     /* entry is a scalar index into the packed value array (q_pack bytes per
-       used entry), not packed bits as in types 1/2.  A sparse or single-entry
-       book can let decode_packed_entry_number fall through with
-       entry==0xffffffff and EOP unset; reject the out-of-range index before
-       it reads q_val past the end. */
+       used entry), not packed bits as in types 1/2. decode_packed_entry_number
+       now forces EOP on a tree-walk fall-through, so the 0xffffffff sentinel
+       is already caught by the oggpack_eop check above; this bound is kept as
+       a defensive net that stops any out-of-range index from reading q_val
+       past its end. */
     if(entry>=(ogg_uint32_t)s->used_entries)return(-1);
     if(ctx->q_bits_le8){
       const unsigned char *ptr =
