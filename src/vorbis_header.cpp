@@ -82,9 +82,9 @@ VorbisHeaderResult parse_vorbis_identification(const uint8_t* packet, size_t pac
     info.vorbis_version = read_le32(packet + VORBIS_VERSION_OFFSET);
     info.channel_count = packet[VORBIS_CHANNELS_OFFSET];
     info.sample_rate = read_le32(packet + VORBIS_SAMPLE_RATE_OFFSET);
-    info.bitrate_maximum = (int32_t)read_le32(packet + VORBIS_BITRATE_MAX_OFFSET);
-    info.bitrate_nominal = (int32_t)read_le32(packet + VORBIS_BITRATE_NOM_OFFSET);
-    info.bitrate_minimum = (int32_t)read_le32(packet + VORBIS_BITRATE_MIN_OFFSET);
+    info.bitrate_maximum = static_cast<int32_t>(read_le32(packet + VORBIS_BITRATE_MAX_OFFSET));
+    info.bitrate_nominal = static_cast<int32_t>(read_le32(packet + VORBIS_BITRATE_NOM_OFFSET));
+    info.bitrate_minimum = static_cast<int32_t>(read_le32(packet + VORBIS_BITRATE_MIN_OFFSET));
 
     constexpr uint8_t BLOCKSIZE_MASK = 0x0F;
     uint8_t blocksizes = packet[VORBIS_BLOCKSIZES_OFFSET];
