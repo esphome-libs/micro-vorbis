@@ -61,6 +61,11 @@ function(tremor_configure_host TARGET SOURCE_DIR)
         -Wdouble-promotion
         -Wformat=2
         -Wimplicit-fallthrough
+        # Any function not declared in a header must be static; keeps
+        # -Wunused-function able to see dead internal functions. Clang and GCC
+        # spell the C++ variant of this check differently.
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wmissing-prototypes>
+        $<$<CXX_COMPILER_ID:GNU>:-Wmissing-declarations>
         $<$<BOOL:${ENABLE_WERROR}>:-Werror>
     )
 
