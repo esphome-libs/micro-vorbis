@@ -27,6 +27,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -36,6 +37,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
