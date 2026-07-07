@@ -154,11 +154,26 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
         if(pw>max_partwords_2) max_partwords_2=pw;
       }
     }
-    /* _01inverse: outer array + per-ch inner arrays */
+    /* _01inverse: outer array + per-ch inner arrays. Its `end` cap is pcmend/2
+       (channel-independent) and it allocates `ch` inner arrays per submap, so
+       summed over all submaps the inner arrays total channels*max_partwords_01
+       (the submaps partition the channels) - already covered above. */
     size += channels * (long)sizeof(int **);
     size += channels * max_partwords_01 * (long)sizeof(int *);
-    /* res2: separate partword array */
-    size += max_partwords_2 * (long)sizeof(int *);
+    /* res2: one partword array per submap. mapping0_inverse calls the residue
+       inverse once per submap (mapping0.c) and res2_inverse allocates its
+       partword array unconditionally (res012.c); the block arena is reset only
+       between packets, so every submap's array is live at once. Unlike res0/1,
+       res2's array size is channel-independent when info->end is the binding cap
+       (each submap then allocates the full max_partwords_2, not a ch-scaled
+       share), so a single reservation undercounts by the submap count. A submap
+       must carry >=1 channel to allocate (ch==0 -> n<=0 -> no alloc) and the
+       submaps partition the channels, so at most min(channels,submaps) res2
+       arrays coexist; submaps is a 4-bit field (<=16). Reserve that many. */
+    {
+      long max_res2_submaps = channels < 16 ? channels : 16;
+      size += max_res2_submaps * max_partwords_2 * (long)sizeof(int *);
+    }
   }
 
   /* mapping0 ARENA_STACK allocations (4 arrays of channels pointers/ints) */
@@ -177,8 +192,11 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
        channels   pcm data buffers         (synthesis.c)
        4          mapping bundles          (mapping0.c: pcm/zero/nonzero/floormemo)
        channels   floor memos              (floor0/1 inverse1)
-       channels   residue inner partwords  (res012.c, summed over submaps)
-       channels   residue outer partwords  (res012.c, per non-empty submap)
+       channels   residue inner arrays     (res012.c: res0/1 per-channel inner
+                                             arrays, summed over submaps)
+       channels   residue outer arrays     (res012.c: res0/1 outer array or res2
+                                             partword array - one per submap, and
+                                             the submaps partition the channels)
      The slack has to scale with channels (Vorbis allows up to 255): the
      decode path dereferences _vorbis_block_alloc's NULL return unchecked,
      so an undersized arena is a crash, not a clean failure. */
@@ -212,6 +230,17 @@ int vorbis_block_clear(vorbis_block *vb){
    next to the arena itself (which is dominated by residue decodemaps). */
 #define DSP_ARENA_SAFETY 256
 
+/* Ceiling on the DSP setup arena. The arena is addressed with `long` offsets
+   (setup_arena_used/_capacity) and handed to a single _ogg_malloc, so on the
+   ILP32 target (ESP32, 32-bit long) it can never exceed 2^31-1 bytes. A crafted
+   header - many modes/submaps all pointing at one residue whose decodemap is
+   hundreds of MB (res012.c) - can drive _vorbis_dsp_arena_compute_size's mirror
+   total past that. Summed into a 32-bit long it would wrap to a small value,
+   _ogg_malloc would then succeed undersized, and res0_look's unchecked arena
+   allocations would scribble past the buffer. The total is computed in 64 bits
+   and any stream over this cap is rejected before the malloc. */
+#define DSP_ARENA_MAX_BYTES 0x7fffffffLL
+
 /* Compute the size of the DSP setup arena from codec_setup_info. Mirrors the
    top-level allocations in _vds_init and, through the per-backend arena_size
    vtable entries, every mode/floor/residue lookup that mapping0_look builds.
@@ -224,11 +253,14 @@ int vorbis_block_clear(vorbis_block *vb){
    mask is fixed before the arena is sized, dropped channels are never allocated
    at all, so there is nothing to free later and the whole DSP state collapses to
    this single allocation. */
-static long _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsigned char *keep){
+/* Returns the mirrored arena size in 64-bit so a maliciously large mode/submap
+   fan-out (each per-mode term is a valid long, but up to 64 modes * 16 submaps
+   can sum past 2^31) cannot wrap; the caller enforces DSP_ARENA_MAX_BYTES. */
+static ogg_int64_t _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsigned char *keep){
   vorbis_info *vi=v->vi;
   codec_setup_info *ci=(codec_setup_info *)vi->codec_setup;
   int channels=vi->channels;
-  long size=0;
+  ogg_int64_t size=0;
   int i;
 
   size+=_vorbis_arena_round(sizeof(private_state));                 /* backend_state */
@@ -257,7 +289,7 @@ static long _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsigned ch
 
 static int _vds_init(vorbis_dsp_state *v,vorbis_info *vi,const unsigned char *keep){
   int i;
-  long arena_size;
+  ogg_int64_t arena_size;
   codec_setup_info *ci=(codec_setup_info *)vi->codec_setup;
   private_state *b=NULL;
 
@@ -276,10 +308,17 @@ static int _vds_init(vorbis_dsp_state *v,vorbis_info *vi,const unsigned char *ke
      is fixed here, before sizing, so dropped channels' history buffers are never
      allocated rather than allocated-then-freed. */
   arena_size=_vorbis_dsp_arena_compute_size(v,keep);
-  v->setup_arena_data=_ogg_malloc(arena_size+DSP_ARENA_SAFETY);
+  /* Reject a header whose mirrored arena can't fit a `long` (see
+     DSP_ARENA_MAX_BYTES). Leaving room for DSP_ARENA_SAFETY keeps the malloc
+     argument and setup_arena_capacity within a positive long on the 32-bit
+     target. A genuinely large but representable arena still fails cleanly at the
+     _ogg_malloc NULL check below. */
+  if(arena_size<0 || arena_size>DSP_ARENA_MAX_BYTES-DSP_ARENA_SAFETY)
+    return -1;
+  v->setup_arena_data=_ogg_malloc((long)arena_size+DSP_ARENA_SAFETY);
   if(!v->setup_arena_data)
     return -1;
-  v->setup_arena_capacity=arena_size+DSP_ARENA_SAFETY;
+  v->setup_arena_capacity=(long)arena_size+DSP_ARENA_SAFETY;
   v->setup_arena_used=0;
 
   b=(private_state *)(v->backend_state=_vorbis_setup_calloc(v,1,sizeof(*b)));

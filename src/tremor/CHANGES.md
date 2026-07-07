@@ -159,6 +159,30 @@ and `a629068d`, May 2026):
   rejects referenced codebooks with no value mapping (`dec_type == 0`,
   i.e. maptype-0 books, unusable by `vorbis_book_decodev_set`) or
   `dim < 1`, and rejects `numbooks < 1`.
+- **Tree-walk fall-off forces end-of-packet** (`codebook.c`): when
+  `decode_packed_entry_number` chases a codebook's decode tree through all
+  `dec_maxlength` bits without reaching a leaf, it now sets the overrun
+  sentinel (`oggpack_seteop`) rather than relying on the trailing
+  `oggpack_adv(b, read+1)` to trip it. That advance's overflow check is
+  byte-granular, so slack in the final partial byte could leave end-of-packet
+  unset and let the `0xffffffff` entry reach `decode_map_apply`, which would
+  then dequantize garbage (`dec_type 1`) or read `q_val` out of bounds
+  (`dec_type 2`, when `quantvals` is not a power of two). Only a one-used-entry
+  book reaches this path: fuller trees are complete or rejected by the
+  underpopulated-tree check in `_make_words`, and a valid stream only emits
+  that book's single codeword, so it never falls off. The `dec_type 3` index
+  bound is kept as a secondary guard.
+- **Zero-entry codebooks parse on ESP-IDF** (`codebook.c`): `entries` is a
+  legal 24-bit field, and `_make_decode_table` is deliberately written to
+  accommodate 0- and 1-sized books (the `nodeb==4` special case). But the
+  `lengthlist` allocations (unordered and ordered cases) and the maptype-2
+  `dec_type 3` `q_val` allocation size themselves from `entries`/`used_entries`,
+  so a zero-entry book requests 0 bytes. `heap_caps_malloc(0)` returns `NULL`
+  on ESP-IDF (glibc returns a unique non-`NULL` pointer), which the `if(!p)`
+  checks would misread as OOM and reject the book, causing a stream to decode
+  on-host but not on-target. The three sizes are now clamped to at least one
+  byte; the read/pack loops that follow are empty when the count is zero, so
+  the extra byte is never touched.
 
 ### Performance changes relative to the lowmem branch
 
@@ -252,7 +276,16 @@ and `a629068d`, May 2026):
     recurses into the floor/residue `arena_size` callbacks per submap. The mirror
     is exact: the computed size equals the arena's final used watermark. A
     256-byte `DSP_ARENA_SAFETY` pad is added as insurance against an
-    overlooked site or platform `sizeof` drift.
+    overlooked site or platform `sizeof` drift. `_vorbis_dsp_arena_compute_size`
+    accumulates and returns the total in `ogg_int64_t`: a crafted header can
+    point up to 64 modes * 16 submaps at one residue whose decodemap is hundreds
+    of MB (`res012.c`), and although each per-mode term is a valid `long`, the
+    sum can exceed `2^31` and would wrap a 32-bit `long` on the ESP32 target to a
+    small value. `_ogg_malloc` would then succeed undersized and `res0_look`'s
+    unchecked arena allocations would scribble past the buffer. `_vds_init`
+    rejects any header whose 64-bit total exceeds `DSP_ARENA_MAX_BYTES`
+    (`2^31-1`, the largest arena a `long` offset can address) via the existing
+    `-1` init-failure path before the allocation.
   - **Per-look freeing is gone**: the backend `free_look` hooks are now no-ops
     and `vorbis_dsp_clear` releases the entire DSP state in a single
     `_ogg_free(setup_arena_data)`. `_vds_init` returns `-1` if the one arena
@@ -458,6 +491,17 @@ compiler-defined `#ifdef __XTENSA__`.
   packet-error bailout, so the malformed packet is dropped cleanly. The
   related `q_pack * dim > 32` unpack-time rejection is described in the
   codebook hardening section.
+
+- **Negative shift exponent from a truncated id header** (`info.c`):
+  `_vorbis_unpack_info` set `ci->blocksizes[i] = 1 << oggpack_read(opb,4)`
+  directly. On a truncated identification packet `oggpack_read` returns its
+  `-1` end-of-packet sentinel, making `1 << -1` a shift by a negative count
+  (UB; UBSan `shift-exponent-negative`). The two reads are now taken into
+  locals and rejected if negative before the shift, mirroring the
+  `rangebits` guard in `floor1.c`; the existing EOP check only fires after
+  the shift. Reachable only through the exported `vorbis_synthesis_headerin`
+  API. The C++ wrapper's 30-byte identification-header minimum keeps every
+  in-tree path away from it.
 
 - **Out-of-bounds value-array index from a sparse codebook**
   (`codebook.c`): the lowmem `_make_words` carries only the
