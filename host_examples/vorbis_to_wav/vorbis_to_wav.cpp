@@ -52,7 +52,7 @@ enum Speaker : uint16_t {
     SR = 0x400,  // side right
 };
 
-ChannelLayout vorbis_channel_layout(unsigned channels) {
+static ChannelLayout vorbis_channel_layout(unsigned channels) {
     // `order` maps each WAV output slot (canonical ascending-bit order) back to
     // the index Vorbis placed that speaker at (Vorbis I spec section 4.3.9).
     switch (channels) {
@@ -73,12 +73,12 @@ ChannelLayout vorbis_channel_layout(unsigned channels) {
     }
 }
 
-void print_usage(const char* program_name) {
+static void print_usage(const char* program_name) {
     std::cerr << "Usage: " << program_name << " <input.ogg> <output.wav>\n";
     std::cerr << "\nConverts an Ogg Vorbis file to WAV format.\n";
 }
 
-void print_error_description(micro_vorbis::OggVorbisResult result) {
+static void print_error_description(micro_vorbis::OggVorbisResult result) {
     switch (result) {
         case micro_vorbis::OGG_VORBIS_DECODER_ERROR_INPUT_INVALID:
             std::cerr << " (OGG_VORBIS_DECODER_ERROR_INPUT_INVALID - Invalid Ogg/Vorbis stream)";

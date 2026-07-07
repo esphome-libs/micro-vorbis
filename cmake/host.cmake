@@ -31,9 +31,14 @@ function(tremor_configure_host TARGET SOURCE_DIR)
     endif()
     target_link_libraries(${TARGET} PUBLIC micro_ogg_demuxer)
 
-    # Internal includes (public include/ is set in the top-level CMakeLists.txt)
-    target_include_directories(${TARGET} PRIVATE
+    # Internal includes (public include/ is set in the top-level CMakeLists.txt).
+    # The forked tremor headers are SYSTEM so first-party C++ that includes them
+    # doesn't inherit their warnings (e.g. C-style casts in headers shared with
+    # the C sources) -- the header-side counterpart of the -w suppression below.
+    target_include_directories(${TARGET} SYSTEM PRIVATE
         ${SOURCE_DIR}/src/tremor
+    )
+    target_include_directories(${TARGET} PRIVATE
         ${SOURCE_DIR}/src
     )
 
@@ -61,6 +66,14 @@ function(tremor_configure_host TARGET SOURCE_DIR)
         -Wdouble-promotion
         -Wformat=2
         -Wimplicit-fallthrough
+        # Any function not declared in a header must be static; keeps
+        # -Wunused-function able to see dead internal functions. Clang and GCC
+        # spell the C++ variant of this check differently.
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wmissing-prototypes>
+        $<$<CXX_COMPILER_ID:GNU>:-Wmissing-declarations>
+        # C++-only (the target also compiles tremor's C sources): require
+        # static_cast/reinterpret_cast over C-style casts
+        $<$<COMPILE_LANGUAGE:CXX>:-Wold-style-cast>
         $<$<BOOL:${ENABLE_WERROR}>:-Werror>
     )
 

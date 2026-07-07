@@ -21,6 +21,17 @@
 #include <cstdint>
 #include <memory>
 
+// Marks functions whose return value must not be ignored (the decoder reports
+// errors only through return codes). [[nodiscard]] needs C++17; the library
+// builds at C++14, so fall back to the GNU attribute there.
+#if defined(__cplusplus) && __cplusplus >= 201703L
+#define MICRO_VORBIS_NODISCARD [[nodiscard]]
+#elif defined(__GNUC__)
+#define MICRO_VORBIS_NODISCARD __attribute__((warn_unused_result))
+#else
+#define MICRO_VORBIS_NODISCARD
+#endif
+
 // Forward declarations to avoid exposing implementation details
 namespace micro_ogg {
 class OggDemuxer;
@@ -368,6 +379,7 @@ public:
     ///       get_required_output_bytes() for the exact byte count and retry.
     /// @note Accepts arbitrarily small input chunks (even 1 byte at a time); an internal
     ///       staging buffer reassembles header packets split across chunks.
+    MICRO_VORBIS_NODISCARD
     OggVorbisResult decode(const uint8_t* input, size_t input_len, uint8_t* output,
                            size_t output_size_bytes, size_t& bytes_consumed, size_t& bytes_written);
 
