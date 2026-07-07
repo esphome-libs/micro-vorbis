@@ -1,5 +1,5 @@
 # microVorbis clang-tidy configuration
-# C++11 compatible, embedded-friendly checks
+# C++14 compatible, embedded-friendly checks
 
 Checks: >
   -*,

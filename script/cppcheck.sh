@@ -52,8 +52,7 @@ cppcheck \
     -I src \
     -I src/tremor \
     -I lib/micro-ogg-demuxer/include \
-    src/ogg_vorbis_decoder.cpp \
-    src/vorbis_header.cpp \
+    src \
     host_examples \
     tests \
     examples
