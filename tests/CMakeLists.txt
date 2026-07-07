@@ -35,6 +35,13 @@ target_link_libraries(test_ogg_vorbis_decoder PRIVATE micro_vorbis)
 target_compile_options(test_ogg_vorbis_decoder PRIVATE
     -Wall
     -Wextra
+    # Any function not declared in a header must be static; keeps
+    # -Wunused-function able to see dead internal functions. Clang and GCC
+    # spell the C++ variant of this check differently.
+    $<$<CXX_COMPILER_ID:Clang,AppleClang>:-Wmissing-prototypes>
+    $<$<CXX_COMPILER_ID:GNU>:-Wmissing-declarations>
+    # Require static_cast/reinterpret_cast over C-style casts
+    -Wold-style-cast
     $<$<BOOL:${ENABLE_WERROR}>:-Werror>
 )
 

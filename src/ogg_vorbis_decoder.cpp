@@ -20,6 +20,7 @@
 #include "vorbis_header.h"
 #include <micro_ogg/ogg_demuxer.h>
 #include <ogg/ogg.h>
+#include <ogg/os_types.h>
 
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"

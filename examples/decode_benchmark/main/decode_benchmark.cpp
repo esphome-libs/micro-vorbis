@@ -27,6 +27,7 @@
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -36,6 +37,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -90,12 +92,12 @@ struct DecodeResult {
 
 // Task parameters
 struct TaskParams {
-    int task_id;
-    DecodeResult* result;
-    SemaphoreHandle_t done_semaphore;
-    int pinned_core;                  // -1 for no pinning, 0 or 1 for specific core
-    const AudioConfig* audio_config;  // Which audio to decode
-    bool measure_footprint;           // Only true for single-task runs (see decode_full_file)
+    int task_id{0};
+    DecodeResult* result{nullptr};
+    SemaphoreHandle_t done_semaphore{nullptr};
+    int pinned_core{-1};                       // -1 for no pinning, 0 or 1 for specific core
+    const AudioConfig* audio_config{nullptr};  // Which audio to decode
+    bool measure_footprint{false};  // Only true for single-task runs (see decode_full_file)
 };
 
 // Initialize statistics structure
@@ -304,7 +306,7 @@ static void log_decode_result(const char* prefix, DecodeResult* result) {
 
 // FreeRTOS task function for concurrent decoding
 static void decode_task(void* params) {
-    TaskParams* task_params = (TaskParams*)params;
+    TaskParams* task_params = static_cast<TaskParams*>(params);
     const AudioConfig* config = task_params->audio_config;
 
     ESP_LOGI(TAG, "Task %d starting %s decode...", task_params->task_id, config->name);
