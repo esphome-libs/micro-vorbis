@@ -172,6 +172,17 @@ and `a629068d`, May 2026):
   underpopulated-tree check in `_make_words`, and a valid stream only emits
   that book's single codeword, so it never falls off. The `dec_type 3` index
   bound is kept as a secondary guard.
+- **Zero-entry codebooks parse on ESP-IDF** (`codebook.c`): `entries` is a
+  legal 24-bit field, and `_make_decode_table` is deliberately written to
+  accommodate 0- and 1-sized books (the `nodeb==4` special case). But the
+  `lengthlist` allocations (unordered and ordered cases) and the maptype-2
+  `dec_type 3` `q_val` allocation size themselves from `entries`/`used_entries`,
+  so a zero-entry book requests 0 bytes. `heap_caps_malloc(0)` returns `NULL`
+  on ESP-IDF (glibc returns a unique non-`NULL` pointer), which the `if(!p)`
+  checks would misread as OOM and reject the book, causing a stream to decoding
+  on-host but not on-target. The three sizes are now clamped to at least one
+  byte; the read/pack loops that follow are empty when the count is zero, so
+  the extra byte is never touched.
 
 ### Performance changes relative to the lowmem branch
 

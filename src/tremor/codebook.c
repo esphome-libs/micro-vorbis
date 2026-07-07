@@ -446,8 +446,12 @@ int vorbis_book_unpack(oggpack_buffer *opb,codebook *s){
     if((s->entries*(unused?1:5)+7)>>3>opb->storage-oggpack_bytes(opb))
       goto _eofout;
     /* unordered */
-    /* ESP32 stack safety: use heap for lengthlist (up to 8192 entries) */
-    lengthlist=(char *)_ogg_malloc(sizeof(*lengthlist)*s->entries);
+    /* ESP32 stack safety: use heap for lengthlist (up to 8192 entries).
+       Request >=1 byte: entries==0 is a legal 24-bit book that the decode
+       table builder accommodates (nodeb==4 special case), but heap_caps_malloc(0)
+       returns NULL on ESP-IDF (glibc returns non-NULL), which would otherwise
+       reject the book. The read loop below is empty when entries==0. */
+    lengthlist=(char *)_ogg_malloc(s->entries?sizeof(*lengthlist)*s->entries:1);
     if(!lengthlist)goto _eofout;
 
     /* allocated but unused entries? */
@@ -484,8 +488,10 @@ int vorbis_book_unpack(oggpack_buffer *opb,codebook *s){
       if(length==0)goto _eofout;
 
       s->used_entries=s->entries;
-      /* ESP32 stack safety: use heap for lengthlist */
-      lengthlist=(char *)_ogg_malloc(sizeof(*lengthlist)*s->entries);
+      /* ESP32 stack safety: use heap for lengthlist. >=1 byte so a legal
+         entries==0 book is not rejected by heap_caps_malloc(0)==NULL on
+         ESP-IDF (see the unordered case above). */
+      lengthlist=(char *)_ogg_malloc(s->entries?sizeof(*lengthlist)*s->entries:1);
       if(!lengthlist)goto _eofout;
 
       for(i=0;i<s->entries;){
@@ -635,7 +641,9 @@ int vorbis_book_unpack(oggpack_buffer *opb,codebook *s){
 
       /* get the vals & pack them */
       s->q_pack=(s->q_bits+7)/8*s->dim;
-      s->q_val=_ogg_codebook_malloc(s->q_pack*s->used_entries);
+      /* >=1 byte: used_entries==0 (a legal zero-entry book) makes this a
+         size-0 request, NULL on ESP-IDF. The pack loop below is then empty. */
+      s->q_val=_ogg_codebook_malloc(s->used_entries?s->q_pack*s->used_entries:1);
       if(!s->q_val)goto _eofout;
 
       if(s->q_bits<=8){
