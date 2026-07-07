@@ -446,7 +446,7 @@ int vorbis_book_unpack(oggpack_buffer *opb,codebook *s){
     if((s->entries*(unused?1:5)+7)>>3>opb->storage-oggpack_bytes(opb))
       goto _eofout;
     /* unordered */
-    /* ESP32 stack safety: use heap for lengthlist (up to 8192 entries).
+    /* ESP32 stack safety: use heap for lengthlist (entries is a 24-bit field).
        Request >=1 byte: entries==0 is a legal 24-bit book that the decode
        table builder accommodates (nodeb==4 special case), but heap_caps_malloc(0)
        returns NULL on ESP-IDF (glibc returns non-NULL), which would otherwise

@@ -179,7 +179,7 @@ and `a629068d`, May 2026):
   `dec_type 3` `q_val` allocation size themselves from `entries`/`used_entries`,
   so a zero-entry book requests 0 bytes. `heap_caps_malloc(0)` returns `NULL`
   on ESP-IDF (glibc returns a unique non-`NULL` pointer), which the `if(!p)`
-  checks would misread as OOM and reject the book, causing a stream to decoding
+  checks would misread as OOM and reject the book, causing a stream to decode
   on-host but not on-target. The three sizes are now clamped to at least one
   byte; the read/pack loops that follow are empty when the count is zero, so
   the extra byte is never touched.
