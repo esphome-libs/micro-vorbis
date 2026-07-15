@@ -54,6 +54,10 @@ typedef struct {
 void res0_free_info(vorbis_info_residue *i){
   vorbis_info_residue0 *info=(vorbis_info_residue0 *)i;
   if(info){
+    /* the struct is calloc'd, so these are NULL until res0_unpack
+       allocates them; safe on partially-initialized structs */
+    _ogg_free(info->secondstages);
+    _ogg_free(info->booklist);
     memset(info,0,sizeof(*info));
     _ogg_free(info);
   }
@@ -100,6 +104,11 @@ vorbis_info_residue *res0_unpack(vorbis_info *vi,oggpack_buffer *opb){
   /* check for premature EOP */
   if(info->groupbook<0)goto errout;
 
+  if(info->partitions<1 || info->partitions>VIR_PARTS)goto errout;
+  info->secondstages=(int *)
+    _ogg_malloc(info->partitions*sizeof(*info->secondstages));
+  if(!info->secondstages)goto errout;
+
   for(j=0;j<info->partitions;j++){
     int cascade=oggpack_read(opb,3);
     int cflag=oggpack_read(opb,1);
@@ -113,6 +122,13 @@ vorbis_info_residue *res0_unpack(vorbis_info *vi,oggpack_buffer *opb){
 
     acc+=icount(cascade);
   }
+
+  /* acc is bounded by construction (cascade is 8 bits, so <=8 set bits per
+     partition, partitions<=VIR_PARTS); check anyway so the allocation size
+     can never outrun the cap */
+  if(acc<0 || acc>VIR_BOOKS)goto errout;
+  info->booklist=(int *)_ogg_malloc((acc?acc:1)*sizeof(*info->booklist));
+  if(!info->booklist)goto errout;
   for(j=0;j<acc;j++){
     int book=oggpack_read(opb,8);
     if(book<0) goto errout;

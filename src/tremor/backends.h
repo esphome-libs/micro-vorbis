@@ -101,6 +101,11 @@ typedef struct{
 			vorbis_info_residue *);
 } vorbis_func_residue;
 
+/* microVorbis: secondstages/booklist were fixed spec-max arrays (64/512);
+   they are heap-allocated to the parsed sizes in res0_unpack, and these are
+   the hard caps the parsed counts are validated against before allocating. */
+#define VIR_PARTS 64          /* partitions: 6-bit read +1 */
+#define VIR_BOOKS (VIR_PARTS*8) /* booklist: <=8 cascade bits per partition */
 typedef struct vorbis_info_residue0{
 /* block-partitioned VQ coded straight residue */
   long  begin;
@@ -111,8 +116,8 @@ typedef struct vorbis_info_residue0{
   int    partitions;       /* possible codebooks for a partition */
   int    partvals;         /* partitions ^ groupbook dim */
   int    groupbook;        /* huffbook for partitioning */
-  int    secondstages[64]; /* expanded out to pointers in lookup */
-  int    booklist[512];    /* list of second stage books */
+  int   *secondstages;     /* [partitions] expanded out to pointers in lookup */
+  int   *booklist;         /* [acc] list of second stage books */
 } vorbis_info_residue0;
 
 /* Mapping backend generic *****************************************/
@@ -128,19 +133,25 @@ typedef struct{
 			vorbis_info_mapping *);
 } vorbis_func_mapping;
 
+/* microVorbis: chmuxlist/coupling_mag/coupling_ang were fixed spec-max
+   arrays (256 each); they are heap-allocated to the parsed sizes in
+   mapping0_unpack, and these are the hard caps the parsed counts are
+   validated against before allocating. */
+#define VIM_CHANNELS 256      /* channels: 8-bit read in the ID header */
+#define VIM_COUPLES 256       /* coupling_steps: 8-bit read +1 */
 typedef struct vorbis_info_mapping0{
   int   submaps;  /* <= 16 */
-  int   chmuxlist[256];   /* up to 256 channels in a Vorbis stream */
-  
+  int  *chmuxlist;         /* [channels]; up to 256 channels in a Vorbis stream */
+
   int   floorsubmap[16];   /* [mux] submap to floors */
   int   residuesubmap[16]; /* [mux] submap to residue */
 
   int   psy[2]; /* by blocktype; impulse/padding for short,
                    transition/normal for long */
 
-  int   coupling_steps;
-  int   coupling_mag[256];
-  int   coupling_ang[256];
+  int   coupling_steps;    /* <= 256 */
+  int  *coupling_mag;      /* [coupling_steps] */
+  int  *coupling_ang;      /* [coupling_steps] */
 } vorbis_info_mapping0;
 
 #endif

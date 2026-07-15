@@ -303,6 +303,28 @@ and `a629068d`, May 2026):
     `vorbis_info` and are heap-allocated through the codebook allocators.)
     See the per-channel decode-mask entry below for the CPU/memory details of
     channel selection itself.
+- **Right-sized setup structs** (`backends.h`, `mapping0.c`, `res012.c`):
+  upstream's parsed setup structs embed spec-maximum fixed arrays regardless of
+  the stream. `vorbis_info_mapping0` reserved `chmuxlist[256]` and
+  `coupling_mag`/`coupling_ang[256]` (3072 bytes), and `vorbis_info_residue0`
+  reserved `secondstages[64]` and `booklist[512]` (2304 bytes); a typical
+  stereo stream (2 mappings + 2 residues) touches a few dozen bytes of that
+  ~10.5 KB. These five arrays are now pointers, heap-allocated by
+  `mapping0_unpack` / `res0_unpack` to the parsed counts that govern every
+  access (`vi->channels`, `coupling_steps`, `partitions`, and the
+  cascade-bit sum `acc`), and freed by `mapping0_free_info` /
+  `res0_free_info` (NULL-safe on partially-initialized structs since the
+  parent struct is calloc'd). Because the allocation sizes now derive from
+  attacker-controlled header fields, each count is validated against an
+  explicit compile-time cap equal to the old fixed size (`VIM_CHANNELS`,
+  `VIM_COUPLES`, `VIR_PARTS`, `VIR_BOOKS` in `backends.h`) before
+  allocating - defense in depth beyond the read bit-widths that already
+  bound them. Two behavioral subtleties: `chmuxlist` is always allocated
+  and zeroed (calloc) because `mapping0_inverse` indexes it for every
+  channel even when `submaps==1` leaves it unfilled, while
+  `coupling_mag`/`ang` stay NULL when there is no coupling (every read is
+  inside a `coupling_steps`-bounded loop); and `booklist` uses the
+  `acc?acc:1` idiom so a zero-book residue never hits `malloc(0)`.
 - **Comment handling removed from the decoder** (`info.c`, `ivorbiscodec.h`):
   the decoder discards Vorbis comments entirely (the OggVorbisDecoder wrapper
   streams the real comment packet past without buffering and feeds a synthetic
@@ -596,14 +618,14 @@ Modified files:
 | --- | --- |
 | `ivorbiscodec.h` | Block + DSP-setup arena fields; encode-only decls removed; `channel_keep` field; `vorbis_synthesis_init_ex()` decl; unused `vorbis_synthesis_init` / `vorbis_synthesis_idheader` / `vorbis_info_blocksize` decls removed (see Dead-Code Policy) |
 | `codec_internal.h` | `static_codebook *book_param[256]` + `codebook *fullbooks` replaced by a single heap-allocated `codebook *book_param` array (lowmem design) |
-| `backends.h` | `arena_size(...)` callback added to the floor/residue/mapping vtables for DSP-setup-arena sizing |
+| `backends.h` | `arena_size(...)` callback added to the floor/residue/mapping vtables for DSP-setup-arena sizing; `vorbis_info_mapping0`'s `chmuxlist`/`coupling_mag`/`coupling_ang` and `vorbis_info_residue0`'s `secondstages`/`booklist` converted from spec-max fixed arrays to right-sized heap pointers, with `VIM_CHANNELS`/`VIM_COUPLES`/`VIR_PARTS`/`VIR_BOOKS` caps |
 | `block.{h,c}` | Block arena alloc/ripcord/sizing + `ARENA_STACK`; `_vorbis_arena_round` and the DSP setup arena (`_vorbis_setup_alloc`/`_calloc`, `_vorbis_dsp_arena_compute_size`, single-free `vorbis_dsp_clear`); `vorbis_synthesis_init_ex` fixes the channel-keep mask before sizing so dropped channels are never allocated and kept `v->pcm[i]` buffers live in the arena; `vorbis_synthesis_pcmout` returns NULL for unkept channels; decode-mask gate in `vorbis_synthesis_blockin`; granpos-difference trim arithmetic in `vorbis_synthesis_blockin` hardened against `ogg_int64_t` overflow on a crafted negative granpos (see UB cleanups); unused channel-blind `vorbis_synthesis_init` shim removed (`vorbis_synthesis_init_ex` is the sole synthesis-init entry point); `block.c` gains `#include "backends.h"`/`"block.h"`; `vorbis_synthesis_read`'s parameter renamed `bytes` to `samples` to match its `ivorbiscodec.h` declaration and its sample-count semantics |
 | `os.h` | Allocator and toolchain hooks; host fallbacks for the codebook allocators |
 | `misc.h` | endianness and `LOOKUP_T` cleanup; unsigned-cast shift fixes (UB cleanup); removed unused `VFLOAT_*` helpers and `CLIP_TO_15` |
 | `codebook.{h,c}` | Replaced with the lowmem-branch single-step design, then modified: `oggpack_eop` emulation; setup `alloca`s (`lengthlist`, `q_val` scratch, `_make_decode_table` `work`) moved to checked heap allocations; NULL checks on `dec_table`/`q_val`/`book_param`; `dim<1` reject; `_book_maptype1_quantvals` saturation; `_make_words` bounds (`rn`); ordered/unordered unpack validation; `decode_map` split into `decode_map_ctx_init`/`decode_map_apply` with shift-range rejection and hoisted invariants; decode `v` scratch = 32-entry stack buffer + heap fallback (was `alloca(4*dim)`); unsigned-cast shift fixes; codebook allocations routed through `_ogg_codebook_*` |
 | `info.c` | Comment handling removed (no `vorbis_comment` struct/init/clear/query; `_vorbis_unpack_comment` skips the packet without allocating; `vorbis_synthesis_headerin` tracks `vi->comment_header_seen` and dropped its `vorbis_comment *` arg); `_vorbis_unpack_books` calls the lowmem `vorbis_book_unpack` into a heap-allocated flat `book_param` array (NULL-checked, via `_ogg_codebook_calloc`); non-positive count guards; per-mode `_ogg_calloc` in the mode loop NULL-checked; unused `vorbis_info_blocksize` / `vorbis_synthesis_idheader` primitives removed (see Dead-Code Policy) |
-| `mapping0.c` | `ARENA_STACK` on decode-path temporaries; decode-mask gate on floor-apply / iMDCT / window in `mapping0_inverse`; `mapping0_unpack` NULL-checks its `vorbis_info_mapping0` allocation; upstream `seq` debug counter, the dead `_analysis_output` scaffolding, and its now-unused `<stdio.h>` include removed; `mapping0_look` routed to the DSP setup arena + `mapping0_arena_size` (recurses into floor/residue sizing); `free_look` no-op |
-| `res012.c` | `ARENA_STACK`/arena allocation for `partword`; `res0_unpack` NULL-checks its `vorbis_info_residue0` allocation; `res0_look` routed to the DSP setup arena + `res0_arena_size`; `free_look` no-op; dead `#ifdef TRAIN_RES` block removed (referenced a `training_data` struct member absent from this fork, it never-compiled encoder-training scaffolding) |
+| `mapping0.c` | `ARENA_STACK` on decode-path temporaries; decode-mask gate on floor-apply / iMDCT / window in `mapping0_inverse`; `mapping0_unpack` NULL-checks its `vorbis_info_mapping0` allocation and right-sizes `chmuxlist`/`coupling_mag`/`coupling_ang` to the validated parsed counts (freed by `mapping0_free_info`); upstream `seq` debug counter, the dead `_analysis_output` scaffolding, and its now-unused `<stdio.h>` include removed; `mapping0_look` routed to the DSP setup arena + `mapping0_arena_size` (recurses into floor/residue sizing); `free_look` no-op |
+| `res012.c` | `ARENA_STACK`/arena allocation for `partword`; `res0_unpack` NULL-checks its `vorbis_info_residue0` allocation and right-sizes `secondstages`/`booklist` to the validated parsed counts (freed by `res0_free_info`); `res0_look` routed to the DSP setup arena + `res0_arena_size`; `free_look` no-op; dead `#ifdef TRAIN_RES` block removed (referenced a `training_data` struct member absent from this fork, it never-compiled encoder-training scaffolding) |
 | `floor0.c` | Setup validation (`ampbits` range, `numbooks<1`, referenced books must have a value mapping and `dim>=1`); `floor0_unpack` NULL-checks its `vorbis_info_floor0` allocation; unsigned-cast shift fix in `vorbis_coslook2_i` and the `floor0_inverse1` amplitude decode (UB cleanups); `vorbis_invsqlook_i` exponent guard; `vorbis_lsp_to_curve` made `static`; `floor0_look` routed to the DSP setup arena + `floor0_arena_size`; `free_look` no-op; unused params cast to `void` (`vorbis_lsp_to_curve`'s `ln`, `floor0_inverse2`'s `vb`) |
 | `floor1.c` | `<math.h>` removed (no behavioral change); unsigned-cast shift fix on `room` (UB cleanup); `floor1_unpack` NULL-checks its `vorbis_info_floor1` allocation; `floor1_look` routed to the DSP setup arena + `floor1_arena_size`; `free_look` no-op; `floor1_inverse2` tail loop converted from `out[j]*=ly` (raw 0-255 dB index) to `out[j]=MULT31_SHIFT15(out[j],FLOOR_fromdB_LOOKUP[ly])`, matching `render_line`. Upstream Tremor never applies the dB lookup here. Dead for spec-valid streams (post X=n is always present, so `hx==n` and the loop body never runs); fixes the in-bounds wrong output for degenerate floor configs where `hx<n`. `ly` is guarded to [0,255]; `floor1_look`'s unused `mi` param cast to `void` |
 | `asm_arm.h` | `CLIP_TO_15` (`_V_CLIP_MATH`) section removed; ARM multiply/LSP helpers retained; unsigned-cast shift fixes in `MULT31`/`XPROD31`/`XNPROD31` (UB cleanup; the `_ARM_ASSEM_` asm path is never built on supported targets) |

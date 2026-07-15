@@ -65,6 +65,11 @@ typedef struct {
 static void mapping0_free_info(vorbis_info_mapping *i){
   vorbis_info_mapping0 *info=(vorbis_info_mapping0 *)i;
   if(info){
+    /* the struct is calloc'd, so these are NULL until mapping0_unpack
+       allocates them; safe on partially-initialized structs */
+    _ogg_free(info->chmuxlist);
+    _ogg_free(info->coupling_mag);
+    _ogg_free(info->coupling_ang);
     memset(info,0,sizeof(*info));
     _ogg_free(info);
   }
@@ -167,11 +172,24 @@ static vorbis_info_mapping *mapping0_unpack(vorbis_info *vi,oggpack_buffer *opb)
   }else
     info->submaps=1;
 
+  /* mapping0_inverse indexes chmuxlist for every channel even when the
+     submap loop below never fills it (submaps==1), so always allocate it
+     zeroed and sized to the channel count */
+  if(vi->channels<1 || vi->channels>VIM_CHANNELS)goto err_out;
+  info->chmuxlist=(int *)_ogg_calloc(vi->channels,sizeof(*info->chmuxlist));
+  if(!info->chmuxlist)goto err_out;
+
   b=oggpack_read(opb,1);
   if(b<0)goto err_out;
   if(b){
     info->coupling_steps=oggpack_read(opb,8)+1;
-    if(info->coupling_steps<=0)goto err_out;
+    if(info->coupling_steps<=0 || info->coupling_steps>VIM_COUPLES)
+      goto err_out;
+    info->coupling_mag=(int *)
+      _ogg_malloc(info->coupling_steps*sizeof(*info->coupling_mag));
+    info->coupling_ang=(int *)
+      _ogg_malloc(info->coupling_steps*sizeof(*info->coupling_ang));
+    if(!info->coupling_mag || !info->coupling_ang)goto err_out;
     for(i=0;i<info->coupling_steps;i++){
       int testM=info->coupling_mag[i]=oggpack_read(opb,ilog(vi->channels));
       int testA=info->coupling_ang[i]=oggpack_read(opb,ilog(vi->channels));
