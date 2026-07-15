@@ -19,13 +19,16 @@ diffing against the original Tremor / libvorbis sources (e.g. libvorbis
 `28965ede` / `a629068d`). A file's diffability against upstream is therefore a
 maintenance asset, and it decides how aggressively unreachable code is pruned:
 
-- **Files kept byte-identical to upstream** (`synthesis.c`, `registry.{c,h}`,
-  the `*_lookup.h` tables) are left verbatim, dead code and all. They expose
-  upstream API the decoder never calls (`vorbis_synthesis_trackonly` and
-  `vorbis_packet_blocksize` in `synthesis.c`, plus the `decodep == 0` arm of
-  `_vorbis_synthesis1` that only `trackonly` reaches), but deleting it would
-  forfeit the zero-diff that keeps porting cheap. That code reports 0% in the
-  fuzzer coverage report by design; it is not a coverage gap to chase.
+- **Files kept byte-identical to upstream** (`registry.{c,h}`, the
+  `*_lookup.h` tables) are left verbatim, dead code and all. `synthesis.c`
+  sat in this set until the `codec_setup_info` right-sizing forced a
+  packet-supplied mode-index bound into it (see Memory Management); it now
+  diverges by only those two guard lines and otherwise keeps upstream's
+  unreachable code (`vorbis_synthesis_trackonly` and
+  `vorbis_packet_blocksize`, plus the `decodep == 0` arm of
+  `_vorbis_synthesis1` that only `trackonly` reaches) because a near-zero
+  diff still keeps porting cheap. That code reports 0% in the fuzzer
+  coverage report by design; it is not a coverage gap to chase.
 - **Files already forked in place** (`info.c`, `block.c`, the floor/residue/
   mapping backends, ...) have no clean upstream diff left to protect, so
   unreachable code in them is removed. This is why the comment-query API,
@@ -325,6 +328,31 @@ and `a629068d`, May 2026):
   `coupling_mag`/`ang` stay NULL when there is no coupling (every read is
   inside a `coupling_steps`-bounded loop); and `booklist` uses the
   `acc?acc:1` idiom so a zero-book residue never hits `malloc(0)`.
+- **Right-sized `codec_setup_info` tables** (`codec_internal.h`, `info.c`,
+  `synthesis.c`): the eight spec-max `[64]` tables in `codec_setup_info`
+  (`mode_param`, `map_type`, `map_param`, `time_type`, `floor_type`,
+  `floor_param`, `residue_type`, `residue_param`; 2048 bytes on a 32-bit
+  target, of which a typical stream uses a few dozen) are now heap pointers
+  allocated by `_vorbis_unpack_books` to the parsed counts
+  (`modes`/`maps`/`times`/`floors`/`residues`, each a 6-bit read +1). Each
+  count is read into a local, validated against `VI_SETUP_MAX` (64, the old
+  fixed size - defense in depth beyond the bit width), and published to `ci`
+  only after the section's table(s) are calloc'd, so `vorbis_info_clear`'s
+  count-bounded free loops can never index a NULL table; for two-table
+  sections (floor/residue/map) both tables exist before the count is
+  nonzero because clear reads both. Clear also frees the tables themselves
+  (NULL-guarded defensively) after the per-entry params. The safety-critical
+  consequence of right-sizing: an audio packet's `mode` field is read with
+  `ilog(modes)` bits, so a non-power-of-two mode count lets a crafted packet
+  encode `mode >= modes`. Against the old `[64]` array that landed on a NULL
+  entry and was rejected by the existing check; against a right-sized table
+  it would be a heap OOB read. `_vorbis_synthesis1` and
+  `vorbis_packet_blocksize` therefore bound `mode` against `ci->modes`
+  (returning `OV_EBADPACKET`) before any `mode_param[mode]` access - the
+  fork's only divergence in `synthesis.c`. Every other index into these
+  tables is a header-time value already validated at unpack
+  (`mode_param[i]->mapping < maps` in `info.c`, `floorsubmap < floors` and
+  `residuesubmap < residues` in `mapping0.c`).
 - **Comment handling removed from the decoder** (`info.c`, `ivorbiscodec.h`):
   the decoder discards Vorbis comments entirely (the OggVorbisDecoder wrapper
   streams the real comment packet past without buffering and feeds a synthetic
@@ -617,13 +645,13 @@ Modified files:
 | File | Change |
 | --- | --- |
 | `ivorbiscodec.h` | Block + DSP-setup arena fields; encode-only decls removed; `channel_keep` field; `vorbis_synthesis_init_ex()` decl; unused `vorbis_synthesis_init` / `vorbis_synthesis_idheader` / `vorbis_info_blocksize` decls removed (see Dead-Code Policy) |
-| `codec_internal.h` | `static_codebook *book_param[256]` + `codebook *fullbooks` replaced by a single heap-allocated `codebook *book_param` array (lowmem design) |
+| `codec_internal.h` | `static_codebook *book_param[256]` + `codebook *fullbooks` replaced by a single heap-allocated `codebook *book_param` array (lowmem design); the eight spec-max `[64]` setup tables (`mode_param`, `map_type`/`map_param`, `time_type`, `floor_type`/`floor_param`, `residue_type`/`residue_param`) converted to right-sized heap pointers with a `VI_SETUP_MAX` cap |
 | `backends.h` | `arena_size(...)` callback added to the floor/residue/mapping vtables for DSP-setup-arena sizing; `vorbis_info_mapping0`'s `chmuxlist`/`coupling_mag`/`coupling_ang` and `vorbis_info_residue0`'s `secondstages`/`booklist` converted from spec-max fixed arrays to right-sized heap pointers, with `VIM_CHANNELS`/`VIM_COUPLES`/`VIR_PARTS`/`VIR_BOOKS` caps |
 | `block.{h,c}` | Block arena alloc/ripcord/sizing + `ARENA_STACK`; `_vorbis_arena_round` and the DSP setup arena (`_vorbis_setup_alloc`/`_calloc`, `_vorbis_dsp_arena_compute_size`, single-free `vorbis_dsp_clear`); `vorbis_synthesis_init_ex` fixes the channel-keep mask before sizing so dropped channels are never allocated and kept `v->pcm[i]` buffers live in the arena; `vorbis_synthesis_pcmout` returns NULL for unkept channels; decode-mask gate in `vorbis_synthesis_blockin`; granpos-difference trim arithmetic in `vorbis_synthesis_blockin` hardened against `ogg_int64_t` overflow on a crafted negative granpos (see UB cleanups); unused channel-blind `vorbis_synthesis_init` shim removed (`vorbis_synthesis_init_ex` is the sole synthesis-init entry point); `block.c` gains `#include "backends.h"`/`"block.h"`; `vorbis_synthesis_read`'s parameter renamed `bytes` to `samples` to match its `ivorbiscodec.h` declaration and its sample-count semantics |
 | `os.h` | Allocator and toolchain hooks; host fallbacks for the codebook allocators |
 | `misc.h` | endianness and `LOOKUP_T` cleanup; unsigned-cast shift fixes (UB cleanup); removed unused `VFLOAT_*` helpers and `CLIP_TO_15` |
 | `codebook.{h,c}` | Replaced with the lowmem-branch single-step design, then modified: `oggpack_eop` emulation; setup `alloca`s (`lengthlist`, `q_val` scratch, `_make_decode_table` `work`) moved to checked heap allocations; NULL checks on `dec_table`/`q_val`/`book_param`; `dim<1` reject; `_book_maptype1_quantvals` saturation; `_make_words` bounds (`rn`); ordered/unordered unpack validation; `decode_map` split into `decode_map_ctx_init`/`decode_map_apply` with shift-range rejection and hoisted invariants; decode `v` scratch = 32-entry stack buffer + heap fallback (was `alloca(4*dim)`); unsigned-cast shift fixes; codebook allocations routed through `_ogg_codebook_*` |
-| `info.c` | Comment handling removed (no `vorbis_comment` struct/init/clear/query; `_vorbis_unpack_comment` skips the packet without allocating; `vorbis_synthesis_headerin` tracks `vi->comment_header_seen` and dropped its `vorbis_comment *` arg); `_vorbis_unpack_books` calls the lowmem `vorbis_book_unpack` into a heap-allocated flat `book_param` array (NULL-checked, via `_ogg_codebook_calloc`); non-positive count guards; per-mode `_ogg_calloc` in the mode loop NULL-checked; unused `vorbis_info_blocksize` / `vorbis_synthesis_idheader` primitives removed (see Dead-Code Policy) |
+| `info.c` | Comment handling removed (no `vorbis_comment` struct/init/clear/query; `_vorbis_unpack_comment` skips the packet without allocating; `vorbis_synthesis_headerin` tracks `vi->comment_header_seen` and dropped its `vorbis_comment *` arg); `_vorbis_unpack_books` calls the lowmem `vorbis_book_unpack` into a heap-allocated flat `book_param` array (NULL-checked, via `_ogg_codebook_calloc`); non-positive count guards; per-mode `_ogg_calloc` in the mode loop NULL-checked; `_vorbis_unpack_books` allocates each section's setup table(s) to the validated parsed count before publishing that count, and `vorbis_info_clear` frees the tables after the per-entry params; unused `vorbis_info_blocksize` / `vorbis_synthesis_idheader` primitives removed (see Dead-Code Policy) |
 | `mapping0.c` | `ARENA_STACK` on decode-path temporaries; decode-mask gate on floor-apply / iMDCT / window in `mapping0_inverse`; `mapping0_unpack` NULL-checks its `vorbis_info_mapping0` allocation and right-sizes `chmuxlist`/`coupling_mag`/`coupling_ang` to the validated parsed counts (freed by `mapping0_free_info`); upstream `seq` debug counter, the dead `_analysis_output` scaffolding, and its now-unused `<stdio.h>` include removed; `mapping0_look` routed to the DSP setup arena + `mapping0_arena_size` (recurses into floor/residue sizing); `free_look` no-op |
 | `res012.c` | `ARENA_STACK`/arena allocation for `partword`; `res0_unpack` NULL-checks its `vorbis_info_residue0` allocation and right-sizes `secondstages`/`booklist` to the validated parsed counts (freed by `res0_free_info`); `res0_look` routed to the DSP setup arena + `res0_arena_size`; `free_look` no-op; dead `#ifdef TRAIN_RES` block removed (referenced a `training_data` struct member absent from this fork, it never-compiled encoder-training scaffolding) |
 | `floor0.c` | Setup validation (`ampbits` range, `numbooks<1`, referenced books must have a value mapping and `dim>=1`); `floor0_unpack` NULL-checks its `vorbis_info_floor0` allocation; unsigned-cast shift fix in `vorbis_coslook2_i` and the `floor0_inverse1` amplitude decode (UB cleanups); `vorbis_invsqlook_i` exponent guard; `vorbis_lsp_to_curve` made `static`; `floor0_look` routed to the DSP setup arena + `floor0_arena_size`; `free_look` no-op; unused params cast to `void` (`vorbis_lsp_to_curve`'s `ln`, `floor0_inverse2`'s `vb`) |
@@ -632,8 +660,9 @@ Modified files:
 | `mdct.c` | `const LOOKUP_T *` fixes; inner `iX` in `mdct_backward`'s rotate+window block reuses the dead function-scope `iX` instead of redeclaring it (removes a `-Wshadow`) |
 | `window.c` | `const LOOKUP_T *` fixes; `<math.h>` removed; window ramps unrolled by 4 |
 | `bitwise.c` | Decode-only subset plus Xtensa funnel-shift fast path |
+| `synthesis.c` | Packet-supplied `mode` bounded against `ci->modes` in `_vorbis_synthesis1` and `vorbis_packet_blocksize` before any `mode_param[mode]` access (required by the right-sized `mode_param` table); otherwise unchanged from upstream |
 
-Unchanged from upstream master: `registry.{c,h}`, `synthesis.c`,
+Unchanged from upstream master: `registry.{c,h}`,
 `window.h`, `lsp_lookup.h`, `mdct.h`, `mdct_lookup.h`,
 `window_lookup.h`.
 
@@ -641,8 +670,8 @@ Unchanged from upstream master: `registry.{c,h}`, `synthesis.c`,
 `#include`s) was dropped from the fork; `ogg/os_types.h` supplies the
 integer typedefs the decoder actually uses.
 
-`synthesis.c` is byte-identical to upstream (the `#include "block.h"` is
-upstream's), but the `block.h` it includes now supplies the arena
-allocator, so the `_vorbis_block_alloc` / `_vorbis_block_ripcord` it calls
-are the fork's `static inline` arena versions, not upstream's extern chain
-allocator.
+`synthesis.c` diverges from upstream only by the two `mode >= ci->modes`
+guards above (the `#include "block.h"` is upstream's), but the `block.h` it
+includes now supplies the arena allocator, so the `_vorbis_block_alloc` /
+`_vorbis_block_ripcord` it calls are the fork's `static inline` arena
+versions, not upstream's extern chain allocator.

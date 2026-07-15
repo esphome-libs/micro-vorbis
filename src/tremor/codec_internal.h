@@ -30,6 +30,8 @@
 
 #include "codebook.h"
 
+#define VI_SETUP_MAX 64  /* modes/maps/times/floors/residues: 6-bit read +1 */
+
 typedef void vorbis_look_mapping;
 typedef void vorbis_look_floor;
 typedef void vorbis_look_residue;
@@ -84,14 +86,19 @@ typedef struct codec_setup_info {
   int        residues;
   int        books;
 
-  vorbis_info_mode       *mode_param[64];
-  int                     map_type[64];
-  vorbis_info_mapping    *map_param[64];
-  int                     time_type[64];
-  int                     floor_type[64];
-  vorbis_info_floor      *floor_param[64];
-  int                     residue_type[64];
-  vorbis_info_residue    *residue_param[64];
+  /* microVorbis: these were fixed [64] tables (the 6-bit-count spec max);
+     they are now heap-allocated by _vorbis_unpack_books to the parsed
+     counts above. Each count is set only after its table(s) are allocated,
+     so vorbis_info_clear's count-bounded loops never index a NULL table.
+     VI_SETUP_MAX caps every allocation at the old fixed size. */
+  vorbis_info_mode      **mode_param;     /* [modes] */
+  int                    *map_type;       /* [maps] */
+  vorbis_info_mapping   **map_param;      /* [maps] */
+  int                    *time_type;      /* [times] */
+  int                    *floor_type;     /* [floors] */
+  vorbis_info_floor     **floor_param;    /* [floors] */
+  int                    *residue_type;   /* [residues] */
+  vorbis_info_residue   **residue_param;  /* [residues] */
   codebook               *book_param;
 
   int    passlimit[32];     /* iteration limit per couple/quant pass */

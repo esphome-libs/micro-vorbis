@@ -812,6 +812,32 @@ static bool test_corrupt_audio_packet_survives() {
     return true;
 }
 
+static bool test_out_of_range_mode_rejected() {
+    // modes3_badmode.ogg is a hand-crafted fixture: a minimal Vorbis stream
+    // (mono, 8 kHz, blocksize 256, floor0 + residue0) with THREE modes -- a
+    // non-power-of-two count, so the packet mode field is read with
+    // ilog(3) = 2 bits and can encode mode == 3, one past the last valid
+    // index. Its first audio packet does exactly that; two valid mode-0
+    // packets follow (granulepos 128). codec_setup_info's mode_param table is
+    // right-sized to ci->modes, so without the bound in synthesis.c the bad
+    // packet is a heap OOB read (regression: setup-struct right-sizing).
+    // The guard must reject it as a bad packet and decoding must continue.
+    std::vector<uint8_t> data = read_file("modes3_badmode.ogg");
+    CHECK(data.size() > 100);
+
+    OggVorbisDecoder dec;
+    DecodeOutput out = decode_stream(dec, data.data(), data.size());
+
+    CHECK(!out.errored);
+    CHECK(out.header_ready);
+    CHECK_EQ(out.sample_rate, 8000u);
+    CHECK_EQ(out.channels, 1u);
+    CHECK(out.eos);
+    // The two valid packets produce one 256-sample block overlap: 128 samples.
+    CHECK_EQ(out.pcm.size(), static_cast<size_t>(128));
+    return true;
+}
+
 // ============================================================================
 // Runner
 // ============================================================================
@@ -837,6 +863,7 @@ static const TestCase TESTS[] = {
     {"error_contract", test_error_contract},
     {"crc_validation", test_crc_validation},
     {"corrupt_audio_packet_survives", test_corrupt_audio_packet_survives},
+    {"out_of_range_mode_rejected", test_out_of_range_mode_rejected},
 };
 
 int main(int argc, char* argv[]) {

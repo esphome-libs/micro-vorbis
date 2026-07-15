@@ -68,20 +68,40 @@ void vorbis_info_clear(vorbis_info *vi){
 
   if(ci){
 
-    for(i=0;i<ci->modes;i++)
-      if(ci->mode_param[i])_ogg_free(ci->mode_param[i]);
+    /* unpack allocates each section's table(s) before setting its count, so
+       a nonzero count implies non-NULL tables; the pointer guards below are
+       defensive. _ogg_free(NULL) is a no-op. */
+    if(ci->mode_param){
+      for(i=0;i<ci->modes;i++)
+	if(ci->mode_param[i])_ogg_free(ci->mode_param[i]);
+      _ogg_free(ci->mode_param);
+    }
 
-    for(i=0;i<ci->maps;i++) /* unpack does the range checking */
-      if(ci->map_param[i])
-	_mapping_P[ci->map_type[i]]->free_info(ci->map_param[i]);
+    if(ci->map_param){ /* unpack does the range checking */
+      for(i=0;i<ci->maps;i++)
+	if(ci->map_param[i])
+	  _mapping_P[ci->map_type[i]]->free_info(ci->map_param[i]);
+      _ogg_free(ci->map_param);
+    }
+    _ogg_free(ci->map_type);
 
-    for(i=0;i<ci->floors;i++) /* unpack does the range checking */
-      if(ci->floor_param[i])
-	_floor_P[ci->floor_type[i]]->free_info(ci->floor_param[i]);
-    
-    for(i=0;i<ci->residues;i++) /* unpack does the range checking */
-      if(ci->residue_param[i])
-	_residue_P[ci->residue_type[i]]->free_info(ci->residue_param[i]);
+    if(ci->floor_param){ /* unpack does the range checking */
+      for(i=0;i<ci->floors;i++)
+	if(ci->floor_param[i])
+	  _floor_P[ci->floor_type[i]]->free_info(ci->floor_param[i]);
+      _ogg_free(ci->floor_param);
+    }
+    _ogg_free(ci->floor_type);
+
+    if(ci->residue_param){ /* unpack does the range checking */
+      for(i=0;i<ci->residues;i++)
+	if(ci->residue_param[i])
+	  _residue_P[ci->residue_type[i]]->free_info(ci->residue_param[i]);
+      _ogg_free(ci->residue_param);
+    }
+    _ogg_free(ci->residue_type);
+
+    _ogg_free(ci->time_type);
 
     if(ci->book_param){
       for(i=0;i<ci->books;i++)
@@ -179,9 +199,21 @@ static int _vorbis_unpack_books(vorbis_info *vi,oggpack_buffer *opb){
     if(vorbis_book_unpack(opb,ci->book_param+i))goto err_out;
   }
 
+  /* Each section below reads its count into a local, validates it against
+     VI_SETUP_MAX (the old fixed-array size; the 6-bit read +1 can't exceed
+     it, but don't trust the bit width alone), allocates the section's
+     table(s) zeroed, and only then publishes the count. vorbis_info_clear
+     iterates the counts and indexes both the type and param tables, so both
+     must exist before the count is nonzero. */
+
   /* time backend settings */
-  ci->times=oggpack_read(opb,6)+1;
-  if(ci->times<=0)goto err_out;
+  {
+    int n=oggpack_read(opb,6)+1;
+    if(n<1 || n>VI_SETUP_MAX)goto err_out;
+    ci->time_type=(int *)_ogg_calloc(n,sizeof(*ci->time_type));
+    if(!ci->time_type)goto err_out;
+    ci->times=n;
+  }
   for(i=0;i<ci->times;i++){
     ci->time_type[i]=oggpack_read(opb,16);
     if(ci->time_type[i]<0 || ci->time_type[i]>=VI_TIMEB)goto err_out;
@@ -191,8 +223,15 @@ static int _vorbis_unpack_books(vorbis_info *vi,oggpack_buffer *opb){
   }
 
   /* floor backend settings */
-  ci->floors=oggpack_read(opb,6)+1;
-  if(ci->floors<=0)goto err_out;
+  {
+    int n=oggpack_read(opb,6)+1;
+    if(n<1 || n>VI_SETUP_MAX)goto err_out;
+    ci->floor_type=(int *)_ogg_calloc(n,sizeof(*ci->floor_type));
+    ci->floor_param=(vorbis_info_floor **)
+      _ogg_calloc(n,sizeof(*ci->floor_param));
+    if(!ci->floor_type || !ci->floor_param)goto err_out;
+    ci->floors=n;
+  }
   for(i=0;i<ci->floors;i++){
     ci->floor_type[i]=oggpack_read(opb,16);
     if(ci->floor_type[i]<0 || ci->floor_type[i]>=VI_FLOORB)goto err_out;
@@ -201,8 +240,15 @@ static int _vorbis_unpack_books(vorbis_info *vi,oggpack_buffer *opb){
   }
 
   /* residue backend settings */
-  ci->residues=oggpack_read(opb,6)+1;
-  if(ci->residues<=0)goto err_out;
+  {
+    int n=oggpack_read(opb,6)+1;
+    if(n<1 || n>VI_SETUP_MAX)goto err_out;
+    ci->residue_type=(int *)_ogg_calloc(n,sizeof(*ci->residue_type));
+    ci->residue_param=(vorbis_info_residue **)
+      _ogg_calloc(n,sizeof(*ci->residue_param));
+    if(!ci->residue_type || !ci->residue_param)goto err_out;
+    ci->residues=n;
+  }
   for(i=0;i<ci->residues;i++){
     ci->residue_type[i]=oggpack_read(opb,16);
     if(ci->residue_type[i]<0 || ci->residue_type[i]>=VI_RESB)goto err_out;
@@ -211,8 +257,15 @@ static int _vorbis_unpack_books(vorbis_info *vi,oggpack_buffer *opb){
   }
 
   /* map backend settings */
-  ci->maps=oggpack_read(opb,6)+1;
-  if(ci->maps<=0)goto err_out;
+  {
+    int n=oggpack_read(opb,6)+1;
+    if(n<1 || n>VI_SETUP_MAX)goto err_out;
+    ci->map_type=(int *)_ogg_calloc(n,sizeof(*ci->map_type));
+    ci->map_param=(vorbis_info_mapping **)
+      _ogg_calloc(n,sizeof(*ci->map_param));
+    if(!ci->map_type || !ci->map_param)goto err_out;
+    ci->maps=n;
+  }
   for(i=0;i<ci->maps;i++){
     ci->map_type[i]=oggpack_read(opb,16);
     if(ci->map_type[i]<0 || ci->map_type[i]>=VI_MAPB)goto err_out;
@@ -221,8 +274,14 @@ static int _vorbis_unpack_books(vorbis_info *vi,oggpack_buffer *opb){
   }
   
   /* mode settings */
-  ci->modes=oggpack_read(opb,6)+1;
-  if(ci->modes<=0)goto err_out;
+  {
+    int n=oggpack_read(opb,6)+1;
+    if(n<1 || n>VI_SETUP_MAX)goto err_out;
+    ci->mode_param=(vorbis_info_mode **)
+      _ogg_calloc(n,sizeof(*ci->mode_param));
+    if(!ci->mode_param)goto err_out;
+    ci->modes=n;
+  }
   for(i=0;i<ci->modes;i++){
     ci->mode_param[i]=(vorbis_info_mode *)_ogg_calloc(1,sizeof(*ci->mode_param[i]));
     if(!ci->mode_param[i])goto err_out;

@@ -46,7 +46,9 @@ target_compile_options(test_ogg_vorbis_decoder PRIVATE
 )
 
 # Test fixtures are checked in; regenerate with generate_test_data.sh if the
-# fixture set needs to change (requires ffmpeg + oggenc).
+# fixture set needs to change (requires ffmpeg + oggenc). Exception:
+# modes3_badmode.ogg is hand-crafted (no encoder emits a non-power-of-two
+# mode count); regenerate it with craft_modes3_badmode.py.
 set(TEST_DATA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/data)
 foreach(fixture
     mono_44100.ogg
@@ -57,7 +59,8 @@ foreach(fixture
     surround50_44100.ogg
     surround51_48000.ogg
     surround61_48000.ogg
-    surround71_48000.ogg)
+    surround71_48000.ogg
+    modes3_badmode.ogg)
     if(NOT EXISTS ${TEST_DATA_DIR}/${fixture})
         message(FATAL_ERROR "Test fixture missing: ${fixture}; run generate_test_data.sh first")
     endif()
@@ -81,6 +84,7 @@ set(DECODER_TESTS
     error_contract
     crc_validation
     corrupt_audio_packet_survives
+    out_of_range_mode_rejected
 )
 
 foreach(test_name IN LISTS DECODER_TESTS)

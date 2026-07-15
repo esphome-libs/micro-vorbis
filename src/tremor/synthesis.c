@@ -49,7 +49,11 @@ static int _vorbis_synthesis1(vorbis_block *vb,ogg_packet *op,int decodep){
   /* read our mode and pre/post windowsize */
   mode=oggpack_read(opb,b->modebits);
   if(mode==-1)return(OV_EBADPACKET);
-  
+  /* modebits (ilog(modes)) can encode values >= a non-power-of-two mode
+     count, and mode_param is allocated to exactly ci->modes entries, so the
+     packet-supplied index must be bounded before any table access */
+  if(mode>=ci->modes)return(OV_EBADPACKET);
+
   vb->mode=mode;
   if(!ci->mode_param[mode]){
     return(OV_EBADPACKET);
@@ -124,7 +128,9 @@ long vorbis_packet_blocksize(vorbis_info *vi,ogg_packet *op){
     /* read our mode and pre/post windowsize */
     mode=oggpack_read(&opb,modebits);
   }
-  if(mode==-1 || !ci->mode_param[mode])return(OV_EBADPACKET);
+  /* bound the packet-supplied index before indexing mode_param, which is
+     allocated to exactly ci->modes entries */
+  if(mode==-1 || mode>=ci->modes || !ci->mode_param[mode])return(OV_EBADPACKET);
   return(ci->blocksizes[ci->mode_param[mode]->blockflag]);
 }
 
