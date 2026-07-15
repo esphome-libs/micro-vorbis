@@ -69,21 +69,25 @@ typedef struct{
 
 } vorbis_info_floor0;
 
+/* microVorbis: partitionclass, the class_ arrays and postlist were fixed
+   spec-max arrays (31/16/16x8/65 ints); they are heap-allocated to the
+   parsed sizes in floor1_unpack, and these are the hard caps the parsed
+   counts are bounded by (partitions: 5-bit read; classes: 4-bit reads;
+   posts: count>VIF_POSIT rejected). */
 #define VIF_POSIT 63
 #define VIF_CLASS 16
 #define VIF_PARTS 31
 typedef struct{
-  int   partitions;                /* 0 to 31 */
-  int   partitionclass[VIF_PARTS]; /* 0 to 15 */
+  int   partitions;      /* 0 to 31 */
+  int  *partitionclass;  /* [partitions]; 0 to 15 */
 
-  int   class_dim[VIF_CLASS];        /* 1 to 8 */
-  int   class_subs[VIF_CLASS];       /* 0,1,2,3 (bits: 1<<n poss) */
-  int   class_book[VIF_CLASS];       /* subs ^ dim entries */
-  int   class_subbook[VIF_CLASS][8]; /* [VIF_CLASS][subs] */
+  int  *class_dim;       /* [maxclass+1]; 1 to 8 */
+  int  *class_subs;      /* [maxclass+1]; 0,1,2,3 (bits: 1<<n poss) */
+  int  *class_book;      /* [maxclass+1]; subs ^ dim entries */
+  int  *class_subbook;   /* [maxclass+1][8] flat, row stride 8 */
 
-
-  int   mult;                      /* 1 2 3 or 4 */ 
-  int   postlist[VIF_POSIT+2];    /* first two implicit */ 
+  int   mult;            /* 1 2 3 or 4 */
+  int  *postlist;        /* [count+2]; first two implicit */
 
 } vorbis_info_floor1;
 

@@ -55,6 +55,14 @@ typedef struct {
 static void floor1_free_info(vorbis_info_floor *i){
   vorbis_info_floor1 *info=(vorbis_info_floor1 *)i;
   if(info){
+    /* the struct is calloc'd, so these are NULL until floor1_unpack
+       allocates them; safe on partially-initialized structs */
+    _ogg_free(info->partitionclass);
+    _ogg_free(info->class_dim);
+    _ogg_free(info->class_subs);
+    _ogg_free(info->class_book);
+    _ogg_free(info->class_subbook);
+    _ogg_free(info->postlist);
     memset(info,0,sizeof(*info));
     _ogg_free(info);
   }
@@ -87,13 +95,31 @@ static vorbis_info_floor *floor1_unpack (vorbis_info *vi,oggpack_buffer *opb){
   if(!info)goto err_out;
   /* read partitions */
   info->partitions=oggpack_read(opb,5); /* only 0 to 31 legal */
+  if(info->partitions<0)goto err_out;
+  if(info->partitions){
+    info->partitionclass=(int *)
+      _ogg_malloc(info->partitions*sizeof(*info->partitionclass));
+    if(!info->partitionclass)goto err_out;
+  }
   for(j=0;j<info->partitions;j++){
     info->partitionclass[j]=oggpack_read(opb,4); /* only 0 to 15 legal */
     if(info->partitionclass[j]<0)goto err_out;
     if(maxclass<info->partitionclass[j])maxclass=info->partitionclass[j];
   }
 
-  /* read partition classes */
+  /* read partition classes; the class arrays stay NULL when partitions==0
+     (maxclass==-1) and are then never indexed on any path */
+  if(maxclass>=0){
+    info->class_dim=(int *)_ogg_malloc((maxclass+1)*sizeof(*info->class_dim));
+    info->class_subs=(int *)_ogg_malloc((maxclass+1)*sizeof(*info->class_subs));
+    /* class_book is read below even when unwritten (class_subs==0), and
+       class_subbook rows are only partially written; zero-fill both */
+    info->class_book=(int *)_ogg_calloc(maxclass+1,sizeof(*info->class_book));
+    info->class_subbook=(int *)
+      _ogg_calloc((maxclass+1)*8,sizeof(*info->class_subbook));
+    if(!info->class_dim || !info->class_subs ||
+       !info->class_book || !info->class_subbook)goto err_out;
+  }
   for(j=0;j<maxclass+1;j++){
     info->class_dim[j]=oggpack_read(opb,3)+1; /* 1 to 8 */
     info->class_subs[j]=oggpack_read(opb,2); /* 0,1,2,3 bits */
@@ -103,25 +129,30 @@ static vorbis_info_floor *floor1_unpack (vorbis_info *vi,oggpack_buffer *opb){
     if(info->class_book[j]<0 || info->class_book[j]>=ci->books)
       goto err_out;
     for(k=0;k<(1<<info->class_subs[j]);k++){
-      info->class_subbook[j][k]=oggpack_read(opb,8)-1;
-      if(info->class_subbook[j][k]<-1 || info->class_subbook[j][k]>=ci->books)
+      info->class_subbook[j*8+k]=oggpack_read(opb,8)-1;
+      if(info->class_subbook[j*8+k]<-1 || info->class_subbook[j*8+k]>=ci->books)
 	goto err_out;
     }
   }
 
   /* read the post list */
-  info->mult=oggpack_read(opb,2)+1;     /* only 1,2,3,4 legal now */ 
+  info->mult=oggpack_read(opb,2)+1;     /* only 1,2,3,4 legal now */
   rangebits=oggpack_read(opb,4);
   if(rangebits<0)goto err_out;
 
-  for(j=0,k=0;j<info->partitions;j++){
-    count+=info->class_dim[info->partitionclass[j]]; 
+  /* the post count is implied by the partition classes; total it up front
+     so the postlist can be right-sized before it is filled */
+  for(j=0;j<info->partitions;j++){
+    count+=info->class_dim[info->partitionclass[j]];
     if(count>VIF_POSIT)goto err_out;
-    for(;k<count;k++){
-      int t=info->postlist[k+2]=oggpack_read(opb,rangebits);
-      if(t<0 || t>=(1<<rangebits))
-	goto err_out;
-    }
+  }
+  info->postlist=(int *)_ogg_malloc((count+2)*sizeof(*info->postlist));
+  if(!info->postlist)goto err_out;
+
+  for(k=0;k<count;k++){
+    int t=info->postlist[k+2]=oggpack_read(opb,rangebits);
+    if(t<0 || t>=(1<<rangebits))
+      goto err_out;
   }
   info->postlist[0]=0;
   info->postlist[1]=1<<rangebits;
@@ -374,7 +405,7 @@ static void *floor1_inverse1(vorbis_block *vb,vorbis_look_floor *in){
       }
 
       for(k=0;k<cdim;k++){
-	int book=info->class_subbook[classv][cval&(csub-1)];
+	int book=info->class_subbook[classv*8+(cval&(csub-1))];
 	cval>>=csubbits;
 	if(book>=0){
 	  if((fit_value[j+k]=vorbis_book_decode(books+book,&vb->opb))==-1)
