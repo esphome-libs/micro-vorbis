@@ -37,21 +37,12 @@
 
 #define floor1_rangedB 140 /* floor 1 fixed at -140dB to 0dB range */
 
-typedef struct {
-  int forward_index[VIF_POSIT+2];
-  
-  int hineighbor[VIF_POSIT];
-  int loneighbor[VIF_POSIT];
-  int posts;
-
-  int n;
-  int quant_q;
-  vorbis_info_floor1 *vi;
-
-} vorbis_look_floor1;
+/* microVorbis: quantized step count per multiplier (1024 -> 256/128/86/64),
+   indexed by mult-1. Was a switch statement in the old floor1_look. */
+static const int floor1_quant_q[4]={256,128,86,64};
 
 /***********************************************/
- 
+
 static void floor1_free_info(vorbis_info_floor *i){
   vorbis_info_floor1 *info=(vorbis_info_floor1 *)i;
   if(info){
@@ -63,14 +54,18 @@ static void floor1_free_info(vorbis_info_floor *i){
     _ogg_free(info->class_book);
     _ogg_free(info->class_subbook);
     _ogg_free(info->postlist);
+    _ogg_free(info->forward_index);
+    _ogg_free(info->hineighbor);
+    _ogg_free(info->loneighbor);
     memset(info,0,sizeof(*info));
     _ogg_free(info);
   }
 }
 
 static void floor1_free_look(vorbis_look_floor *i){
-  /* microVorbis: the look struct now lives in the DSP setup arena (see
-     floor1_look / floor1_arena_size), freed in one shot by vorbis_dsp_clear. */
+  /* microVorbis: floor1_look() is now an identity function returning the
+     vorbis_info_floor1 pointer - there is no separate look allocation to
+     free. The info struct itself is freed by floor1_free_info. */
   (void)i;
 }
 
@@ -166,94 +161,78 @@ static vorbis_info_floor *floor1_unpack (vorbis_info *vi,oggpack_buffer *opb){
 
     for(j=1;j<count+2;j++)
       if(*sortpointer[j-1]==*sortpointer[j])goto err_out;
+
+    /* microVorbis: decode-time precompute, formerly built in floor1_look
+       (see src/tremor/CHANGES.md). We drop each position value
+       in-between already decoded values, and use linear interpolation to
+       predict each new value past the edges. The positions are read in
+       the order of the position list... we precompute the bounding
+       positions here. Of course, the neighbors can change (if a position
+       is declined), but this is an initial mapping. Reuses the sort
+       above (points from sort order back to range number) rather than
+       re-sorting. */
+    info->posts=count+2;
+    info->forward_index=(unsigned char *)
+      _ogg_malloc(info->posts*sizeof(*info->forward_index));
+    if(!info->forward_index)goto err_out;
+    for(j=0;j<info->posts;j++)
+      info->forward_index[j]=(unsigned char)(sortpointer[j]-info->postlist);
+  }
+
+  /* discover our neighbors for decode where we don't use fit flags
+     (that would push the neighbors outward) */
+  if(count){
+    info->hineighbor=(unsigned char *)
+      _ogg_malloc(count*sizeof(*info->hineighbor));
+    info->loneighbor=(unsigned char *)
+      _ogg_malloc(count*sizeof(*info->loneighbor));
+    if(!info->hineighbor || !info->loneighbor)goto err_out;
+  }
+  for(j=0;j<count;j++){
+    int lo=0;
+    int hi=1;
+    int lx=0;
+    int hx=info->postlist[1];
+    int currentx=info->postlist[j+2];
+    for(k=0;k<j+2;k++){
+      int x=info->postlist[k];
+      if(x>lx && x<currentx){
+	lo=k;
+	lx=x;
+      }
+      if(x<hx && x>currentx){
+	hi=k;
+	hx=x;
+      }
+    }
+    info->loneighbor[j]=(unsigned char)lo;
+    info->hineighbor[j]=(unsigned char)hi;
   }
 
   return(info);
-  
+
  err_out:
   floor1_free_info(info);
   return(NULL);
 }
 
+/* microVorbis: identity function - all decode-time precompute now lives in
+   vorbis_info_floor1, built once at unpack (see floor1_unpack). Keeps the
+   vorbis_func_floor vtable shape (look() is still called by mapping0_look
+   for every mode) without a separate DSP-arena allocation. */
 static vorbis_look_floor *floor1_look(vorbis_dsp_state *vd,vorbis_info_mode *mi,
                               vorbis_info_floor *in){
-
-  int *sortpointer[VIF_POSIT+2];
-  vorbis_info_floor1 *info=(vorbis_info_floor1 *)in;
-  vorbis_look_floor1 *look=(vorbis_look_floor1 *)_vorbis_setup_calloc(vd,1,sizeof(*look));
-  int i,j,n=0;
-  (void)mi;
-
-  look->vi=info;
-  look->n=info->postlist[1];
- 
-  /* we drop each position value in-between already decoded values,
-     and use linear interpolation to predict each new value past the
-     edges.  The positions are read in the order of the position
-     list... we precompute the bounding positions in the lookup.  Of
-     course, the neighbors can change (if a position is declined), but
-     this is an initial mapping */
-
-  for(i=0;i<info->partitions;i++)n+=info->class_dim[info->partitionclass[i]];
-  n+=2;
-  look->posts=n;
-
-  /* also store a sorted position index */
-  for(i=0;i<n;i++)sortpointer[i]=info->postlist+i;
-  qsort(sortpointer,n,sizeof(*sortpointer),icomp);
-
-  /* points from sort order back to range number */
-  for(i=0;i<n;i++)look->forward_index[i]=sortpointer[i]-info->postlist;
-  
-  /* quantize values to multiplier spec */
-  switch(info->mult){
-  case 1: /* 1024 -> 256 */
-    look->quant_q=256;
-    break;
-  case 2: /* 1024 -> 128 */
-    look->quant_q=128;
-    break;
-  case 3: /* 1024 -> 86 */
-    look->quant_q=86;
-    break;
-  case 4: /* 1024 -> 64 */
-    look->quant_q=64;
-    break;
-  }
-
-  /* discover our neighbors for decode where we don't use fit flags
-     (that would push the neighbors outward) */
-  for(i=0;i<n-2;i++){
-    int lo=0;
-    int hi=1;
-    int lx=0;
-    int hx=look->n;
-    int currentx=info->postlist[i+2];
-    for(j=0;j<i+2;j++){
-      int x=info->postlist[j];
-      if(x>lx && x<currentx){
-	lo=j;
-	lx=x;
-      }
-      if(x<hx && x>currentx){
-	hi=j;
-	hx=x;
-      }
-    }
-    look->loneighbor[i]=lo;
-    look->hineighbor[i]=hi;
-  }
-
-  return(look);
+  (void)vd;(void)mi;
+  return (vorbis_look_floor *)in;
 }
 
-/* microVorbis: bytes floor1_look() bumps from the DSP setup arena. floor1's
-   look struct has only fixed-size embedded arrays, so it is the sole
-   allocation. Keep in sync with floor1_look. */
+/* microVorbis: floor1_look() no longer allocates from the DSP setup arena -
+   all decode-time precompute is built once in floor1_unpack into the info
+   struct. Keep in sync with floor1_look. */
 static long floor1_arena_size(vorbis_dsp_state *vd,vorbis_info_mode *mi,
                               vorbis_info_floor *i){
   (void)vd;(void)mi;(void)i;
-  return _vorbis_arena_round(sizeof(vorbis_look_floor1));
+  return 0;
 }
 
 static int render_point(int x0,int x1,int y0,int y1,int x){
@@ -374,19 +353,19 @@ static void render_line(int n, int x0,int x1,int y0,int y1,ogg_int32_t *d){
 }
 
 static void *floor1_inverse1(vorbis_block *vb,vorbis_look_floor *in){
-  vorbis_look_floor1 *look=(vorbis_look_floor1 *)in;
-  vorbis_info_floor1 *info=look->vi;
+  vorbis_info_floor1 *info=(vorbis_info_floor1 *)in;
   codec_setup_info   *ci=(codec_setup_info *)vb->vd->vi->codec_setup;
-  
+
   int i,j,k;
+  int quant_q=floor1_quant_q[info->mult-1];
   codebook *books=ci->book_param;
-  
+
   /* unpack wrapped/predicted values from stream */
   if(oggpack_read(&vb->opb,1)==1){
-    int *fit_value=(int *)_vorbis_block_alloc(vb,(look->posts)*sizeof(*fit_value));
-    
-    fit_value[0]=oggpack_read(&vb->opb,ilog(look->quant_q-1));
-    fit_value[1]=oggpack_read(&vb->opb,ilog(look->quant_q-1));
+    int *fit_value=(int *)_vorbis_block_alloc(vb,(info->posts)*sizeof(*fit_value));
+
+    fit_value[0]=oggpack_read(&vb->opb,ilog(quant_q-1));
+    fit_value[1]=oggpack_read(&vb->opb,ilog(quant_q-1));
     
     /* partition by partition */
     /* partition by partition */
@@ -418,13 +397,13 @@ static void *floor1_inverse1(vorbis_block *vb,vorbis_look_floor *in){
     }
 
     /* unwrap positive values and reconsitute via linear interpolation */
-    for(i=2;i<look->posts;i++){
-      int predicted=render_point(info->postlist[look->loneighbor[i-2]],
-				 info->postlist[look->hineighbor[i-2]],
-				 fit_value[look->loneighbor[i-2]],
-				 fit_value[look->hineighbor[i-2]],
+    for(i=2;i<info->posts;i++){
+      int predicted=render_point(info->postlist[info->loneighbor[i-2]],
+				 info->postlist[info->hineighbor[i-2]],
+				 fit_value[info->loneighbor[i-2]],
+				 fit_value[info->hineighbor[i-2]],
 				 info->postlist[i]);
-      int hiroom=look->quant_q-predicted;
+      int hiroom=quant_q-predicted;
       int loroom=predicted;
       int room=(int)((unsigned int)(hiroom<loroom?hiroom:loroom)<<1);
       int val=fit_value[i];
@@ -445,13 +424,13 @@ static void *floor1_inverse1(vorbis_block *vb,vorbis_look_floor *in){
 	}
 
 	fit_value[i]=(val+predicted)&0x7fff;;
-	fit_value[look->loneighbor[i-2]]&=0x7fff;
-	fit_value[look->hineighbor[i-2]]&=0x7fff;
+	fit_value[info->loneighbor[i-2]]&=0x7fff;
+	fit_value[info->hineighbor[i-2]]&=0x7fff;
 
       }else{
 	fit_value[i]=predicted|0x8000;
       }
-	
+
     }
 
     return(fit_value);
@@ -462,8 +441,7 @@ static void *floor1_inverse1(vorbis_block *vb,vorbis_look_floor *in){
 
 static int floor1_inverse2(vorbis_block *vb,vorbis_look_floor *in,void *memo,
 			  ogg_int32_t *out){
-  vorbis_look_floor1 *look=(vorbis_look_floor1 *)in;
-  vorbis_info_floor1 *info=look->vi;
+  vorbis_info_floor1 *info=(vorbis_info_floor1 *)in;
 
   codec_setup_info   *ci=(codec_setup_info *)vb->vd->vi->codec_setup;
   int                  n=ci->blocksizes[vb->W]/2;
@@ -478,8 +456,8 @@ static int floor1_inverse2(vorbis_block *vb,vorbis_look_floor *in,void *memo,
     /* guard lookup against out-of-range values */
     ly=(ly<0?0:ly>255?255:ly);
 
-    for(j=1;j<look->posts;j++){
-      int current=look->forward_index[j];
+    for(j=1;j<info->posts;j++){
+      int current=info->forward_index[j];
       int hy=fit_value[current]&0x7fff;
       if(hy==fit_value[current]){
 	

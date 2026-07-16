@@ -89,6 +89,15 @@ typedef struct{
   int   mult;            /* 1 2 3 or 4 */
   int  *postlist;        /* [count+2]; first two implicit */
 
+  /* microVorbis: decode-time precompute, built in floor1_unpack from the
+     postlist/class data above (see src/tremor/CHANGES.md). Replaces
+     vorbis_look_floor1 - this is the only lookup floor1 decode needs, so
+     floor1_look now just hands back this struct. */
+  int   posts;            /* count+2; postlist entry count */
+  unsigned char *forward_index; /* [posts]; sort order -> range number */
+  unsigned char *hineighbor;    /* [posts-2] */
+  unsigned char *loneighbor;    /* [posts-2] */
+
 } vorbis_info_floor1;
 
 /* Residue backend generic *****************************************/
