@@ -230,9 +230,11 @@ int vorbis_block_clear(vorbis_block *vb){
    _vorbis_dsp_arena_compute_size() is exact (it mirrors every allocation with
    the same ARENA_ALIGN rounding the bump allocator uses), so this is pure
    insurance against an overlooked site or platform sizeof drift; it is tiny
-   next to the arena itself. (Residue no longer contributes here: res0_look()
-   returns the info pointer directly and res0_arena_size() is 0 - see
-   res012.c and src/tremor/CHANGES.md.) */
+   next to the arena itself. (Residue, floor1, and mapping0 no longer
+   contribute here: their look()s return the info pointer directly and their
+   arena_size()s are 0 - floor0 is the only backend whose look() still
+   allocates - see res012.c, floor1.c, mapping0.c and
+   src/tremor/CHANGES.md.) */
 #define DSP_ARENA_SAFETY 256
 
 /* Ceiling on the DSP setup arena. The arena is addressed with `long` offsets
@@ -248,9 +250,15 @@ int vorbis_block_clear(vorbis_block *vb){
 
 /* Compute the size of the DSP setup arena from codec_setup_info. Mirrors the
    top-level allocations in _vds_init and, through the per-backend arena_size
-   vtable entries, every mode/floor/residue lookup that mapping0_look builds.
-   Each term is rounded to ARENA_ALIGN exactly as _vorbis_setup_alloc rounds, so
-   for a correct mirror the return value equals the arena's final used watermark.
+   vtable entries, every floor/residue lookup mapping0_look builds. mapping0
+   itself no longer owns any arena state (vorbis_info_mapping0 is the "look");
+   floor1 and every residue backend are likewise identity look()s that
+   contribute 0. floor0 is the only backend whose look() still allocates
+   (linearmap/lsp_look, cached per blockflag on vorbis_info_floor0 - see
+   mapping0.c and backends.h), so it is the only nonzero term this loop
+   actually sums in practice. Each term is rounded to ARENA_ALIGN exactly as
+   _vorbis_setup_alloc rounds, so for a correct mirror the return value equals
+   the arena's final used watermark.
 
    The per-channel work[] planes (n1/2 int32s each) are counted for ALL
    channels: residue decode and channel coupling touch every channel, so

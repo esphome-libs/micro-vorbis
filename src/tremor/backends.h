@@ -67,6 +67,25 @@ typedef struct{
   int   numbooks; /* <= 16 */
   int   books[16];
 
+  /* microVorbis: floor0 is the only backend whose look() still computes real
+     decode-time state (linearmap/lsp_look - see floor0_look in floor0.c,
+     deliberately unmodified by the mapping0 look-elimination pass; unlike
+     floor1/residue, whose look() is now an identity that just hands back the
+     info pointer). floor0_look's output also depends on the mode's blockflag
+     (blocksize), not just this info struct, so it can't be collapsed to an
+     identity. mapping0_look still builds it - once per mode, exactly what
+     mapping0_arena_size counts - but caches the result here (keyed by
+     blockflag: 0=short block, 1=long block) instead of in a mapping0-owned
+     struct, so mapping0's own arena contribution stays zero. Safe to cache on
+     the info struct: a given vorbis_info_floor0/codec_setup_info is used by
+     exactly one vorbis_dsp_state over its lifetime (one vorbis_synthesis_init_ex
+     call per parsed header), and the setup arena these pointers reference is
+     torn down together with the info struct (vorbis_dsp_clear then
+     vorbis_info_clear), so there is no cross-instance dangling-pointer risk.
+     NULL until mapping0_look runs (never read before then - b->mode[] is
+     fully built in _vds_init before any packet is decoded). */
+  void *look_cache[2];
+
 } vorbis_info_floor0;
 
 /* microVorbis: partitionclass, the class_ arrays and postlist were fixed
