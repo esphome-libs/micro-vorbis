@@ -366,8 +366,11 @@ byte-identical to the pre-port decoder.
 - **`ARENA_STACK` macro** (defined in `block.h`) replaces decode-path
   `alloca`-style allocations in:
   - `mapping0.c`: `pcmbundle`, `zerobundle`, `nonzero`, `floormemo`.
-  - `res012.c`: the `partword` pointer array in `_01inverse` (its rows and
-    `res2_inverse`'s `partword` come from `_vorbis_block_alloc` directly).
+  - `res012.c`: the `partword` outer pointer array in `_01inverse` (its
+    per-channel rows and `res2_inverse`'s `partword` come from
+    `_vorbis_block_alloc` directly; since the residue look-layer elimination
+    below, each row is a flat `unsigned char` array of decoded partition-class
+    indices, not an array of pointers into a setup-arena decodemap).
 
   The codebook decode helpers do not use the arena; their per-vector
   scratch is a fixed stack buffer with heap fallback (see the codebook
@@ -378,11 +381,12 @@ byte-identical to the pre-port decoder.
   per-stream DSP state is the second source of small-allocation churn after the
   per-packet block arena. Upstream `vorbis_synthesis_init` heap-allocates the
   `private_state`, the `pcm`/`pcmret`/`channel_keep` pointer arrays, each
-  channel's PCM history buffer, the `b->mode` table, and (the dominant count)
-  every floor/residue/mapping lookup that `*_look` builds (a residue `decodemap`
-  alone is `partitions^groupbook_dim` separate allocations). On a typical stereo
-  stream this is ~240 individual `_ogg_malloc`s. The fork replaces them with one
-  pre-sized arena:
+  channel's PCM history buffer, the `b->mode` table, and (originally the
+  dominant count) every floor/residue/mapping lookup that `*_look` builds (a
+  residue `decodemap` alone was `partitions^groupbook_dim` separate
+  allocations, before the residue look-layer elimination below removed it
+  entirely). On a typical stereo stream this was ~240 individual
+  `_ogg_malloc`s. The fork replaces them with one pre-sized arena:
   - **Fields** (`vorbis_dsp_state`): `setup_arena_data`, `setup_arena_capacity`,
     `setup_arena_used`. Bump-allocated via `_vorbis_setup_alloc` /
     `_vorbis_setup_calloc` (`static inline` in `block.h`, same `ARENA_ALIGN`
@@ -393,20 +397,22 @@ byte-identical to the pre-port decoder.
     to each backend vtable (`vorbis_func_floor` / `_residue` / `_mapping` in
     `backends.h`); each `*_arena_size` lives in the same file as its `*_look`
     (the `vorbis_look_*` structs are file-local) and mirrors that function's
-    allocations 1:1, including using the same local `ilog`. `mapping0_arena_size`
-    recurses into the floor/residue `arena_size` callbacks per submap. The mirror
+    allocations 1:1. `mapping0_arena_size`
+    recurses into the floor/residue `arena_size` callbacks per submap; `res0_arena_size`
+    (residue backends 0/1/2) is a constant `0` since the residue look-layer
+    elimination below - `res0_look` no longer allocates. The mirror
     is exact: the computed size equals the arena's final used watermark. A
     256-byte `DSP_ARENA_SAFETY` pad is added as insurance against an
     overlooked site or platform `sizeof` drift. `_vorbis_dsp_arena_compute_size`
     accumulates and returns the total in `ogg_int64_t`: a crafted header can
-    point up to 64 modes * 16 submaps at one residue whose decodemap is hundreds
-    of MB (`res012.c`), and although each per-mode term is a valid `long`, the
+    point up to 64 modes * 16 submaps at floor/mapping lookups whose combined
+    size is large, and although each per-mode term is a valid `long`, the
     sum can exceed `2^31` and would wrap a 32-bit `long` on the ESP32 target to a
-    small value. `_ogg_malloc` would then succeed undersized and `res0_look`'s
-    unchecked arena allocations would scribble past the buffer. `_vds_init`
-    rejects any header whose 64-bit total exceeds `DSP_ARENA_MAX_BYTES`
-    (`2^31-1`, the largest arena a `long` offset can address) via the existing
-    `-1` init-failure path before the allocation.
+    small value. `_ogg_malloc` would then succeed undersized and a backend
+    `*_look`'s unchecked arena allocations would scribble past the buffer.
+    `_vds_init` rejects any header whose 64-bit total exceeds
+    `DSP_ARENA_MAX_BYTES` (`2^31-1`, the largest arena a `long` offset can
+    address) via the existing `-1` init-failure path before the allocation.
   - **Per-look freeing is gone**: the backend `free_look` hooks are now no-ops
     and `vorbis_dsp_clear` releases the entire DSP state in a single
     `_ogg_free(setup_arena_data)`. `_vds_init` returns `-1` if the one arena
@@ -430,6 +436,35 @@ byte-identical to the pre-port decoder.
     heap-allocated through the codebook allocators.) See the per-channel
     decode-mask entry below for the CPU/memory details of channel
     selection itself.
+- **Residue look-layer elimination** (`backends.h`, `res012.c`): lowmem
+  Tremor has no `vorbis_look_residue0` at all - every decode-time precompute
+  lives in the parsed setup struct, built once at unpack. The fork now
+  matches: `vorbis_info_residue0` gains `stagemasks`/`stagebooks`/`stages`
+  (heap-allocated in `res0_unpack` to `partitions`/`partitions*8` from the
+  same `secondstages`/`booklist` data `res0_look` used to consume, freed by
+  `res0_free_info`), replacing `vorbis_look_residue0`'s `partbooks`
+  (`codebook ***`) and `decodemap` (`int **`, `partitions^groupbook_dim`
+  rows of `groupbook_dim` ints - the single largest DSP-arena term before
+  this change). `res0_look` is now an identity function returning the info
+  pointer; `res0_arena_size` returns `0`; `res0_free_look` stays a no-op
+  (nothing to free). `_01inverse`/`res2_inverse` decode each partition
+  codeword's class indices arithmetically instead of indexing `decodemap`
+  (lowmem's approach, ported into this fork's `_01inverse`/`res2_inverse`
+  split rather than lowmem's merged single-function `res_inverse`): the
+  phrasebook-decoded `temp` is split into `partitions_per_word` digits,
+  most-significant first, by successive division against descending powers
+  of `info->partitions` - the same digit order `decodemap[temp][k]` produced,
+  so the change is bit-exact. `partword` changes from a block-arena array of
+  pointers into the (now-gone) setup-arena `decodemap` to a flat per-channel
+  `unsigned char` array of decoded class indices (`ARENA_STACK` outer array +
+  `_vorbis_block_alloc`'d rows, as before - see the `ARENA_STACK` entry
+  above); `_vorbis_arena_compute_size`'s residue terms in `block.c` are
+  resized accordingly (`partwords * dim` bytes per row instead of `partwords`
+  pointers). The `temp>=info->partvals` bounds check (rejecting a phrasebook
+  entry beyond the valid partition-word range, same as before) is kept: it is
+  what guarantees every decoded digit lands in `[0, info->partitions)`, which
+  `stagemasks`/`stagebooks` are sized for - lowmem's own `res_inverse`
+  omits this check, but dropping it here would be an out-of-bounds read.
 - **Right-sized setup structs** (`backends.h`, `mapping0.c`, `res012.c`):
   upstream's parsed setup structs embed spec-maximum fixed arrays regardless of
   the stream. `vorbis_info_mapping0` reserved `chmuxlist[256]` and
@@ -813,14 +848,14 @@ Modified files:
 | --- | --- |
 | `ivorbiscodec.h` | Block + DSP-setup arena fields; encode-only decls removed; `channel_keep` field; `vorbis_synthesis_init_ex()` decl; unused `vorbis_synthesis_init` / `vorbis_synthesis_idheader` / `vorbis_info_blocksize` decls removed (see Dead-Code Policy) |
 | `codec_internal.h` | `static_codebook *book_param[256]` + `codebook *fullbooks` replaced by a single heap-allocated `codebook *book_param` array (lowmem design); the eight spec-max `[64]` setup tables (`mode_param`, `map_type`/`map_param`, `time_type`, `floor_type`/`floor_param`, `residue_type`/`residue_param`) converted to right-sized heap pointers with a `VI_SETUP_MAX` cap |
-| `backends.h` | `arena_size(...)` callback added to the floor/residue/mapping vtables for DSP-setup-arena sizing; `vorbis_info_mapping0`'s `chmuxlist`/`coupling_mag`/`coupling_ang`, `vorbis_info_residue0`'s `secondstages`/`booklist`, and `vorbis_info_floor1`'s `partitionclass`/`class_dim`/`class_subs`/`class_book`/`class_subbook`/`postlist` converted from spec-max fixed arrays to right-sized heap pointers (`class_subbook` flattened to stride-8 rows), with `VIM_CHANNELS`/`VIM_COUPLES`/`VIR_PARTS`/`VIR_BOOKS` caps and the existing `VIF_PARTS`/`VIF_CLASS`/`VIF_POSIT` bounds |
-| `block.{h,c}` | Block arena alloc/ripcord/sizing + `ARENA_STACK` (no longer sized for any per-channel PCM buffer - see Synthesis / MDCT Subsystem); `_vorbis_arena_round` and the DSP setup arena (`_vorbis_setup_alloc`/`_calloc`, `_vorbis_dsp_arena_compute_size`, single-free `vorbis_dsp_clear`); `vorbis_synthesis_init_ex` fixes the channel-keep mask before sizing so a dropped channel's `mdctright[]` tail is never allocated (`work[]` is allocated for every channel); `vorbis_synthesis_pcmout` replaced by `vorbis_synthesis_pcmavail`/`_lapout` (`_lapout` returns `OV_EINVAL` for an unkept channel, replacing the old NULL-plane report); `vorbis_synthesis_blockin` is now bookkeeping-only (`out_begin`/`out_end` readout window replaces `pcm_current`/`pcm_returned`; the decode-mask gates that used to live here moved to `mapping0_inverse`, `synthesis.c`'s `mdct_shift_right` loop, and `vorbis_synthesis_lapout`); granpos-difference trim arithmetic hardened against `ogg_int64_t` overflow on a crafted negative granpos (see UB cleanups), now operating on `out_begin`/`out_end`; unused channel-blind `vorbis_synthesis_init` shim removed (`vorbis_synthesis_init_ex` is the sole synthesis-init entry point); `block.c` gains `#include "backends.h"`/`"block.h"`; `vorbis_synthesis_read`'s parameter renamed `bytes` to `samples` to match its `ivorbiscodec.h` declaration and its sample-count semantics |
+| `backends.h` | `arena_size(...)` callback added to the floor/residue/mapping vtables for DSP-setup-arena sizing; `vorbis_info_mapping0`'s `chmuxlist`/`coupling_mag`/`coupling_ang`, `vorbis_info_residue0`'s `secondstages`/`booklist`, and `vorbis_info_floor1`'s `partitionclass`/`class_dim`/`class_subs`/`class_book`/`class_subbook`/`postlist` converted from spec-max fixed arrays to right-sized heap pointers (`class_subbook` flattened to stride-8 rows), with `VIM_CHANNELS`/`VIM_COUPLES`/`VIR_PARTS`/`VIR_BOOKS` caps and the existing `VIF_PARTS`/`VIF_CLASS`/`VIF_POSIT` bounds; `vorbis_info_residue0` gains `stagemasks`/`stagebooks`/`stages` (residue look-layer elimination, see Memory Management) |
+| `block.{h,c}` | Block arena alloc/ripcord/sizing + `ARENA_STACK` (no longer sized for any per-channel PCM buffer - see Synthesis / MDCT Subsystem); `_vorbis_arena_round` and the DSP setup arena (`_vorbis_setup_alloc`/`_calloc`, `_vorbis_dsp_arena_compute_size`, single-free `vorbis_dsp_clear`); `vorbis_synthesis_init_ex` fixes the channel-keep mask before sizing so a dropped channel's `mdctright[]` tail is never allocated (`work[]` is allocated for every channel); `vorbis_synthesis_pcmout` replaced by `vorbis_synthesis_pcmavail`/`_lapout` (`_lapout` returns `OV_EINVAL` for an unkept channel, replacing the old NULL-plane report); `vorbis_synthesis_blockin` is now bookkeeping-only (`out_begin`/`out_end` readout window replaces `pcm_current`/`pcm_returned`; the decode-mask gates that used to live here moved to `mapping0_inverse`, `synthesis.c`'s `mdct_shift_right` loop, and `vorbis_synthesis_lapout`); granpos-difference trim arithmetic hardened against `ogg_int64_t` overflow on a crafted negative granpos (see UB cleanups), now operating on `out_begin`/`out_end`; unused channel-blind `vorbis_synthesis_init` shim removed (`vorbis_synthesis_init_ex` is the sole synthesis-init entry point); `block.c` gains `#include "backends.h"`/`"block.h"`; `vorbis_synthesis_read`'s parameter renamed `bytes` to `samples` to match its `ivorbiscodec.h` declaration and its sample-count semantics; `_vorbis_arena_compute_size`'s residue `partword` terms recount for the flat `unsigned char` row layout (`partwords*dim` bytes/channel) instead of a pointer-array layout (residue look-layer elimination, see Memory Management) |
 | `os.h` | Allocator and toolchain hooks; host fallbacks for the codebook allocators |
 | `misc.h` | endianness and `LOOKUP_T` cleanup; unsigned-cast shift fixes (UB cleanup); removed unused `VFLOAT_*` helpers and `CLIP_TO_15` |
 | `codebook.{h,c}` | Replaced with the lowmem-branch single-step design, then modified: `oggpack_eop` emulation; setup `alloca`s (`lengthlist`, `q_val` scratch, `_make_decode_table` `work`) moved to checked heap allocations; NULL checks on `dec_table`/`q_val`/`book_param`; `dim<1` reject; `_book_maptype1_quantvals` saturation; `_make_words` bounds (`rn`); ordered/unordered unpack validation; `decode_map` split into `decode_map_ctx_init`/`decode_map_apply` with shift-range rejection and hoisted invariants; decode `v` scratch = 32-entry stack buffer + heap fallback (was `alloca(4*dim)`); unsigned-cast shift fixes; codebook allocations routed through `_ogg_codebook_*` |
 | `info.c` | Comment handling removed (no `vorbis_comment` struct/init/clear/query; `_vorbis_unpack_comment` skips the packet without allocating; `vorbis_synthesis_headerin` tracks `vi->comment_header_seen` and dropped its `vorbis_comment *` arg); `_vorbis_unpack_books` calls the lowmem `vorbis_book_unpack` into a heap-allocated flat `book_param` array (NULL-checked, via `_ogg_codebook_calloc`); non-positive count guards; per-mode `_ogg_calloc` in the mode loop NULL-checked; `_vorbis_unpack_books` allocates each section's setup table(s) to the validated parsed count before publishing that count, and `vorbis_info_clear` frees the tables after the per-entry params; unused `vorbis_info_blocksize` / `vorbis_synthesis_idheader` primitives removed (see Dead-Code Policy) |
 | `mapping0.c` | `ARENA_STACK` on decode-path temporaries; `mapping0_inverse` writes into `vd->work[]` (the lowmem half-transform plane) instead of a block-arena PCM buffer, and its decode-mask gate covers floor-apply / half-block iMDCT only (windowing moved to readout-time `mdct_unroll_lap`, gated there instead - see Synthesis / MDCT Subsystem); `mapping0_unpack` NULL-checks its `vorbis_info_mapping0` allocation and right-sizes `chmuxlist`/`coupling_mag`/`coupling_ang` to the validated parsed counts (freed by `mapping0_free_info`); upstream `seq` debug counter, the dead `_analysis_output` scaffolding, and its now-unused `<stdio.h>` include removed; `mapping0_look` routed to the DSP setup arena + `mapping0_arena_size` (recurses into floor/residue sizing); `free_look` no-op |
-| `res012.c` | `ARENA_STACK`/arena allocation for `partword`; `res0_unpack` NULL-checks its `vorbis_info_residue0` allocation and right-sizes `secondstages`/`booklist` to the validated parsed counts (freed by `res0_free_info`); `res0_look` routed to the DSP setup arena + `res0_arena_size`; `free_look` no-op; dead `#ifdef TRAIN_RES` block removed (referenced a `training_data` struct member absent from this fork, it never-compiled encoder-training scaffolding) |
+| `res012.c` | `ARENA_STACK`/arena allocation for `partword`; `res0_unpack` NULL-checks its `vorbis_info_residue0` allocation, right-sizes `secondstages`/`booklist` to the validated parsed counts, and (residue look-layer elimination) builds `stagemasks`/`stagebooks`/`stages` from them (freed by `res0_free_info`); `res0_look` is now an identity function (returns the info pointer) and `res0_arena_size` returns `0` - no more `vorbis_look_residue0`, `partbooks`, or `decodemap`; `_01inverse`/`res2_inverse` decode each partition codeword's class indices arithmetically (lowmem's classword digit decomposition) instead of a `decodemap[]` lookup, and `partword` rows are flat `unsigned char` class-index arrays instead of `int` pointer arrays into `decodemap`; `free_look` no-op; dead `#ifdef TRAIN_RES` block removed (referenced a `training_data` struct member absent from this fork, it never-compiled encoder-training scaffolding) |
 | `floor0.c` | Setup validation (`ampbits` range, `numbooks<1`, referenced books must have a value mapping and `dim>=1`); `floor0_unpack` NULL-checks its `vorbis_info_floor0` allocation; unsigned-cast shift fix in `vorbis_coslook2_i` and the `floor0_inverse1` amplitude decode (UB cleanups); `vorbis_invsqlook_i` exponent guard; `vorbis_lsp_to_curve` made `static`; `floor0_look` routed to the DSP setup arena + `floor0_arena_size`; `free_look` no-op; unused params cast to `void` (`vorbis_lsp_to_curve`'s `ln`, `floor0_inverse2`'s `vb`) |
 | `floor1.c` | `<math.h>` removed (no behavioral change); unsigned-cast shift fix on `room` (UB cleanup); `floor1_unpack` NULL-checks its `vorbis_info_floor1` allocation and right-sizes the six setup arrays to the parsed counts (staged allocation as each count is discovered, plus a post-count pre-pass before the `postlist` fill; freed by `floor1_free_info`); `floor1_look` routed to the DSP setup arena + `floor1_arena_size`; `free_look` no-op; `floor1_inverse2` tail loop converted from `out[j]*=ly` (raw 0-255 dB index) to `out[j]=MULT31_SHIFT15(out[j],FLOOR_fromdB_LOOKUP[ly])`, matching `render_line`. Upstream Tremor never applies the dB lookup here. Dead for spec-valid streams (post X=n is always present, so `hx==n` and the loop body never runs); fixes the in-bounds wrong output for degenerate floor configs where `hx<n`. `ly` is guarded to [0,255]; `floor1_look`'s unused `mi` param cast to `void` |
 | `asm_arm.h` | `CLIP_TO_15` (`_V_CLIP_MATH`) section removed; ARM multiply/LSP helpers retained; unsigned-cast shift fixes in `MULT31`/`XPROD31`/`XNPROD31` (UB cleanup; the `_ARM_ASSEM_` asm path is never built on supported targets) |

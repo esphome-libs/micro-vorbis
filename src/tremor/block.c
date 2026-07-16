@@ -117,15 +117,19 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
     size += channels * max_floor;
   }
 
-  /* Residue partword allocations: res012.c
-     _01inverse (types 0,1): ch * sizeof(int**) + ch * partwords * sizeof(int*)
-     res2_inverse (type 2):  partwords * sizeof(int*)
-     _01inverse caps `end` at pcmend/2; res2_inverse caps at pcmend*ch/2, so
-     res2 can have up to `ch` times the partitions of res0/res1. Track the
-     per-type worst case separately. */
+  /* Residue partword allocations: res012.c (lowmem classword decode, see
+     src/tremor/CHANGES.md)
+     _01inverse (types 0,1): ch * sizeof(uchar*) + ch * (partwords*dim) * sizeof(uchar)
+     res2_inverse (type 2):  (partwords*dim) * sizeof(uchar)
+     partword is now a flat per-channel byte array of partwords*partitions_per_word
+     (== dim) class indices, not an array of partwords pointers into a
+     setup-arena decodemap, so the per-word cost scales with dim (bytes), not
+     with a fixed pointer size. _01inverse caps `end` at pcmend/2; res2_inverse
+     caps at pcmend*ch/2, so res2 can have up to `ch` times the partitions of
+     res0/res1. Track the per-type worst case separately. */
   {
-    long max_partwords_01=0;
-    long max_partwords_2=0;
+    long max_bytes_01=0;
+    long max_bytes_2=0;
     for(i=0;i<ci->residues;i++){
       vorbis_info_residue0 *ri=(vorbis_info_residue0 *)ci->residue_param[i];
       long end_cap_01=n/2;
@@ -138,7 +142,8 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
       if(rn01>0){
         long partvals=rn01/ri->grouping;
         long pw=(partvals+dim-1)/dim;
-        if(pw>max_partwords_01) max_partwords_01=pw;
+        long bytes=pw*dim; /* one unsigned char per partition index */
+        if(bytes>max_bytes_01) max_bytes_01=bytes;
       }
 
       long end2=ri->end < end_cap_2 ? ri->end : end_cap_2;
@@ -146,28 +151,31 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
       if(rn2>0){
         long partvals=rn2/ri->grouping;
         long pw=(partvals+dim-1)/dim;
-        if(pw>max_partwords_2) max_partwords_2=pw;
+        long bytes=pw*dim;
+        if(bytes>max_bytes_2) max_bytes_2=bytes;
       }
     }
-    /* _01inverse: outer array + per-ch inner arrays. Its `end` cap is pcmend/2
-       (channel-independent) and it allocates `ch` inner arrays per submap, so
-       summed over all submaps the inner arrays total channels*max_partwords_01
-       (the submaps partition the channels) - already covered above. */
-    size += channels * (long)sizeof(int **);
-    size += channels * max_partwords_01 * (long)sizeof(int *);
-    /* res2: one partword array per submap. mapping0_inverse calls the residue
-       inverse once per submap (mapping0.c) and res2_inverse allocates its
-       partword array unconditionally (res012.c); the block arena is reset only
-       between packets, so every submap's array is live at once. Unlike res0/1,
-       res2's array size is channel-independent when info->end is the binding cap
-       (each submap then allocates the full max_partwords_2, not a ch-scaled
-       share), so a single reservation undercounts by the submap count. A submap
-       must carry >=1 channel to allocate (ch==0 -> n<=0 -> no alloc) and the
-       submaps partition the channels, so at most min(channels,submaps) res2
-       arrays coexist; submaps is a 4-bit field (<=16). Reserve that many. */
+    /* _01inverse: outer pointer array + per-ch inner byte arrays. Its `end` cap
+       is pcmend/2 (channel-independent) and it allocates `ch` inner arrays per
+       submap, so summed over all submaps the inner arrays total
+       channels*max_bytes_01 (the submaps partition the channels) - already
+       covered above. */
+    size += channels * (long)sizeof(unsigned char *);
+    size += channels * max_bytes_01;
+    /* res2: one partword byte array per submap. mapping0_inverse calls the
+       residue inverse once per submap (mapping0.c) and res2_inverse allocates
+       its partword array unconditionally (res012.c); the block arena is reset
+       only between packets, so every submap's array is live at once. Unlike
+       res0/1, res2's array size is channel-independent when info->end is the
+       binding cap (each submap then allocates the full max_bytes_2, not a
+       ch-scaled share), so a single reservation undercounts by the submap
+       count. A submap must carry >=1 channel to allocate (ch==0 -> n<=0 -> no
+       alloc) and the submaps partition the channels, so at most
+       min(channels,submaps) res2 arrays coexist; submaps is a 4-bit field
+       (<=16). Reserve that many. */
     {
       long max_res2_submaps = channels < 16 ? channels : 16;
-      size += max_res2_submaps * max_partwords_2 * (long)sizeof(int *);
+      size += max_res2_submaps * max_bytes_2;
     }
   }
 
@@ -222,18 +230,20 @@ int vorbis_block_clear(vorbis_block *vb){
    _vorbis_dsp_arena_compute_size() is exact (it mirrors every allocation with
    the same ARENA_ALIGN rounding the bump allocator uses), so this is pure
    insurance against an overlooked site or platform sizeof drift; it is tiny
-   next to the arena itself (which is dominated by residue decodemaps). */
+   next to the arena itself. (Residue no longer contributes here: res0_look()
+   returns the info pointer directly and res0_arena_size() is 0 - see
+   res012.c and src/tremor/CHANGES.md.) */
 #define DSP_ARENA_SAFETY 256
 
 /* Ceiling on the DSP setup arena. The arena is addressed with `long` offsets
    (setup_arena_used/_capacity) and handed to a single _ogg_malloc, so on the
    ILP32 target (ESP32, 32-bit long) it can never exceed 2^31-1 bytes. A crafted
-   header - many modes/submaps all pointing at one residue whose decodemap is
-   hundreds of MB (res012.c) - can drive _vorbis_dsp_arena_compute_size's mirror
-   total past that. Summed into a 32-bit long it would wrap to a small value,
-   _ogg_malloc would then succeed undersized, and res0_look's unchecked arena
-   allocations would scribble past the buffer. The total is computed in 64 bits
-   and any stream over this cap is rejected before the malloc. */
+   header - many modes/submaps fanning out into per-mode floor/mapping lookups -
+   can drive _vorbis_dsp_arena_compute_size's mirror total past that. Summed
+   into a 32-bit long it would wrap to a small value,
+   _ogg_malloc would then succeed undersized, and a backend look()'s unchecked
+   arena allocations would scribble past the buffer. The total is computed in
+   64 bits and any stream over this cap is rejected before the malloc. */
 #define DSP_ARENA_MAX_BYTES 0x7fffffffLL
 
 /* Compute the size of the DSP setup arena from codec_setup_info. Mirrors the

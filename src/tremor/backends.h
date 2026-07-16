@@ -122,6 +122,14 @@ typedef struct vorbis_info_residue0{
   int    groupbook;        /* huffbook for partitioning */
   int   *secondstages;     /* [partitions] expanded out to pointers in lookup */
   int   *booklist;         /* [acc] list of second stage books */
+
+  /* microVorbis: decode-time precompute, built in res0_unpack from
+     secondstages/booklist above (see src/tremor/CHANGES.md). Replaces
+     vorbis_look_residue0's partbooks - this is the only lookup residue
+     decode needs, so res0_look now just hands back this struct. */
+  unsigned char *stagemasks; /* [partitions]; bit s set iff partition p has a stage-s book */
+  unsigned char *stagebooks; /* [partitions*8], index (p<<3)+s; valid iff stagemasks[p]&(1<<s) */
+  int    stages;            /* max stage count across all partitions */
 } vorbis_info_residue0;
 
 /* Mapping backend generic *****************************************/

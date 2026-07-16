@@ -36,21 +36,6 @@
 #include "os.h"
 #include "block.h"
 
-typedef struct {
-  vorbis_info_residue0 *info;
-  int         map;
-  
-  int         parts;
-  int         stages;
-  codebook   *book_param;
-  codebook   *phrasebook;
-  codebook ***partbooks;
-
-  int         partvals;
-  int       **decodemap;
-
-} vorbis_look_residue0;
-
 void res0_free_info(vorbis_info_residue *i){
   vorbis_info_residue0 *info=(vorbis_info_residue0 *)i;
   if(info){
@@ -58,25 +43,19 @@ void res0_free_info(vorbis_info_residue *i){
        allocates them; safe on partially-initialized structs */
     _ogg_free(info->secondstages);
     _ogg_free(info->booklist);
+    _ogg_free(info->stagemasks);
+    _ogg_free(info->stagebooks);
     memset(info,0,sizeof(*info));
     _ogg_free(info);
   }
 }
 
 void res0_free_look(vorbis_look_residue *i){
-  /* microVorbis: the look struct, partbooks (outer + per-partition), and
-     decodemap (outer + per-partval rows) all live in the DSP setup arena (see
-     res0_look / res0_arena_size), freed in one shot by vorbis_dsp_clear. */
+  /* microVorbis: no look struct - res0_look() returns the vorbis_info_residue0
+     pointer directly (its stagemasks/stagebooks/stages, built in res0_unpack,
+     are the only decode-time state residue needs). Nothing to free here; the
+     info struct is owned by res0_free_info via codec_setup_info. */
   (void)i;
-}
-
-static int ilog(unsigned int v){
-  int ret=0;
-  while(v){
-    ret++;
-    v>>=1;
-  }
-  return(ret);
 }
 
 static int icount(unsigned int v){
@@ -141,6 +120,33 @@ vorbis_info_residue *res0_unpack(vorbis_info *vi,oggpack_buffer *opb){
     if(ci->book_param[info->booklist[j]].dec_type==0)goto errout;
   }
 
+  /* microVorbis: precompute the decode-time stagemasks/stagebooks (replaces
+     vorbis_look_residue0's partbooks). Same partition-major, stage-minor
+     order res0_look used to walk booklist in, so this consumes it
+     identically; book numbers fit unsigned char because ci->books<=256 (8-bit
+     read +1) and every booklist[] entry above is already validated <ci->books. */
+  {
+    int k,bookidx=0;
+    info->stagemasks=(unsigned char *)
+      _ogg_malloc(info->partitions*sizeof(*info->stagemasks));
+    if(!info->stagemasks)goto errout;
+    info->stagebooks=(unsigned char *)
+      _ogg_malloc(info->partitions*8*sizeof(*info->stagebooks));
+    if(!info->stagebooks)goto errout;
+
+    for(j=0;j<info->partitions;j++){
+      info->stagemasks[j]=(unsigned char)info->secondstages[j];
+      for(k=0;k<8;k++){
+        if(info->secondstages[j]&(1<<k)){
+          info->stagebooks[(j<<3)+k]=(unsigned char)info->booklist[bookidx++];
+          if(k+1>info->stages)info->stages=k+1;
+        }else{
+          info->stagebooks[(j<<3)+k]=0xff; /* unused; never read (mask bit clear) */
+        }
+      }
+    }
+  }
+
   /* verify the phrasebook is not specifying an impossible or
      inconsistent partitioning scheme. */
   /* modify the phrasebook ranging check from r16327; an early beta
@@ -166,87 +172,21 @@ vorbis_info_residue *res0_unpack(vorbis_info *vi,oggpack_buffer *opb){
   return(NULL);
 }
 
+/* microVorbis: no look layer - res0_unpack already built everything decode
+   needs (stagemasks/stagebooks/stages) into the vorbis_info_residue0 struct,
+   so look is just the info pointer handed back. Matches the identity-look
+   pattern the other backends move to (steps 2-3). */
 vorbis_look_residue *res0_look(vorbis_dsp_state *vd,vorbis_info_mode *vm,
 			  vorbis_info_residue *vr){
-  vorbis_info_residue0 *info=(vorbis_info_residue0 *)vr;
-  vorbis_look_residue0 *look=(vorbis_look_residue0 *)_vorbis_setup_calloc(vd,1,sizeof(*look));
-  codec_setup_info     *ci=(codec_setup_info *)vd->vi->codec_setup;
-
-  int j,k,acc=0;
-  int dim;
-  int maxstage=0;
-  look->info=info;
-  look->map=vm->mapping;
-
-  look->parts=info->partitions;
-  look->book_param=ci->book_param;
-  look->phrasebook=ci->book_param+info->groupbook;
-  dim=look->phrasebook->dim;
-
-  look->partbooks=(codebook ***)_vorbis_setup_calloc(vd,look->parts,sizeof(*look->partbooks));
-
-  for(j=0;j<look->parts;j++){
-    int stages=ilog(info->secondstages[j]);
-    if(stages){
-      if(stages>maxstage)maxstage=stages;
-      look->partbooks[j]=(codebook **)_vorbis_setup_calloc(vd,stages,sizeof(*look->partbooks[j]));
-      for(k=0;k<stages;k++)
-	if(info->secondstages[j]&(1<<k)){
-	  look->partbooks[j][k]=ci->book_param+info->booklist[acc++];
-	}
-    }
-  }
-
-  look->partvals=look->parts;
-  for(j=1;j<dim;j++)look->partvals*=look->parts;
-  look->stages=maxstage;
-  look->decodemap=(int **)_vorbis_setup_alloc(vd,look->partvals*sizeof(*look->decodemap));
-  for(j=0;j<look->partvals;j++){
-    long val=j;
-    long mult=look->partvals/look->parts;
-    look->decodemap[j]=(int *)_vorbis_setup_alloc(vd,dim*sizeof(*look->decodemap[j]));
-    for(k=0;k<dim;k++){
-      long deco=val/mult;
-      val-=deco*mult;
-      mult/=look->parts;
-      look->decodemap[j][k]=deco;
-    }
-  }
-
-  return(look);
+  (void)vd;(void)vm;
+  return (vorbis_look_residue *)vr;
 }
 
-/* microVorbis: bytes res0_look() bumps from the DSP setup arena. Mirrors the
-   five allocation sites in res0_look 1:1 (look struct, partbooks outer + one
-   per stage-bearing partition, decodemap outer + one per partval). Uses the
-   same ilog() as res0_look so the per-partition stage counts agree. The
-   per-partval decodemap rows dominate (partvals = partitions^groupdim), which
-   is exactly the allocation churn the arena collapses. Keep in sync with
-   res0_look. */
+/* microVorbis: res0_look() no longer touches the DSP setup arena. */
 static long res0_arena_size(vorbis_dsp_state *vd,vorbis_info_mode *vm,
 			    vorbis_info_residue *vr){
-  vorbis_info_residue0 *info=(vorbis_info_residue0 *)vr;
-  codec_setup_info     *ci=(codec_setup_info *)vd->vi->codec_setup;
-  codebook *phrasebook=ci->book_param+info->groupbook;
-  long dim=phrasebook->dim;
-  long parts=info->partitions;
-  long partvals,size=0;
-  int j;
-  (void)vm;
-
-  size+=_vorbis_arena_round(sizeof(vorbis_look_residue0));
-  size+=_vorbis_arena_round(parts*(long)sizeof(codebook **)); /* partbooks outer */
-  for(j=0;j<parts;j++){
-    int stages=ilog(info->secondstages[j]);
-    if(stages)
-      size+=_vorbis_arena_round(stages*(long)sizeof(codebook *));
-  }
-  partvals=parts;
-  for(j=1;j<dim;j++)partvals*=parts;
-  size+=_vorbis_arena_round(partvals*(long)sizeof(int *)); /* decodemap outer */
-  for(j=0;j<partvals;j++)
-    size+=_vorbis_arena_round(dim*(long)sizeof(int));      /* decodemap[j] */
-  return size;
+  (void)vd;(void)vm;(void)vr;
+  return 0;
 }
 
 
@@ -257,12 +197,13 @@ static int _01inverse(vorbis_block *vb,vorbis_look_residue *vl,
 					 oggpack_buffer *,int,int)){
 
   long i,j,k,l,s;
-  vorbis_look_residue0 *look=(vorbis_look_residue0 *)vl;
-  vorbis_info_residue0 *info=look->info;
+  vorbis_info_residue0 *info=(vorbis_info_residue0 *)vl;
+  codec_setup_info     *ci=(codec_setup_info *)vb->vd->vi->codec_setup;
+  codebook             *phrasebook=ci->book_param+info->groupbook;
 
   /* move all this setup out later */
   int samples_per_partition=info->grouping;
-  int partitions_per_word=look->phrasebook->dim;
+  int partitions_per_word=(int)phrasebook->dim;
   int max=vb->pcmend>>1;
   int end=(info->end<max?info->end:max);
   int n=end-info->begin;
@@ -270,42 +211,54 @@ static int _01inverse(vorbis_block *vb,vorbis_look_residue *vl,
   if(n>0){
     int partvals=n/samples_per_partition;
     int partwords=(partvals+partitions_per_word-1)/partitions_per_word;
-    ARENA_STACK(int **, partword, ch, vb);
+    ARENA_STACK(unsigned char *, partword, ch, vb);
 
     for(j=0;j<ch;j++)
-      partword[j]=(int **)_vorbis_block_alloc(vb,partwords*sizeof(*partword[j]));
-    
-    for(s=0;s<look->stages;s++){
-      
-      /* each loop decodes on partition codeword containing 
+      partword[j]=(unsigned char *)_vorbis_block_alloc(vb,(long)partwords*partitions_per_word*sizeof(*partword[j]));
+
+    for(s=0;s<info->stages;s++){
+
+      /* each loop decodes on partition codeword containing
 	 partitions_pre_word partitions */
       for(i=0,l=0;i<partvals;l++){
+	long base=l*(long)partitions_per_word;
 	if(s==0){
-	  /* fetch the partition word for each channel */
+	  /* fetch the partition word for each channel and unpack it into
+	     partitions_per_word class indices, most-significant digit first
+	     (base info->partitions) - lowmem's classword arithmetic, replacing
+	     the old decodemap[] lookup table. temp<info->partvals (checked
+	     below) guarantees every digit lands in [0,info->partitions), so
+	     the stagemasks/stagebooks index below is always in range. */
 	  for(j=0;j<ch;j++){
-	    int temp=vorbis_book_decode(look->phrasebook,&vb->opb);
+	    int temp=vorbis_book_decode(phrasebook,&vb->opb);
+	    long div;
 	    if(temp==-1 || temp>=info->partvals)goto eopbreak;
-	    partword[j][l]=look->decodemap[temp];
-	    if(partword[j][l]==NULL)goto errout;
+
+	    div=1;
+	    for(k=partitions_per_word-2;k>=0;k--)div*=info->partitions;
+	    for(k=0;k<partitions_per_word;k++){
+	      long q=temp/div;
+	      partword[j][base+k]=(unsigned char)q;
+	      temp-=(int)(q*div);
+	      div/=info->partitions;
+	    }
 	  }
 	}
-	
+
 	/* now we decode residual values for the partitions */
 	for(k=0;k<partitions_per_word && i<partvals;k++,i++)
 	  for(j=0;j<ch;j++){
 	    long offset=info->begin+i*samples_per_partition;
-	    if(info->secondstages[partword[j][l][k]]&(1<<s)){
-	      codebook *stagebook=look->partbooks[partword[j][l][k]][s];
-	      if(stagebook){
-		if(decodepart(stagebook,in[j]+offset,&vb->opb,
-			      samples_per_partition,-8)==-1)goto eopbreak;
-	      }
+	    int idx=partword[j][base+k];
+	    if(info->stagemasks[idx]&(1<<s)){
+	      codebook *stagebook=ci->book_param+info->stagebooks[(idx<<3)+s];
+	      if(decodepart(stagebook,in[j]+offset,&vb->opb,
+			    samples_per_partition,-8)==-1)goto eopbreak;
 	    }
 	  }
-      } 
+      }
     }
   }
- errout:
  eopbreak:
   return(0);
 }
@@ -338,12 +291,13 @@ int res1_inverse(vorbis_block *vb,vorbis_look_residue *vl,
 int res2_inverse(vorbis_block *vb,vorbis_look_residue *vl,
 		 ogg_int32_t **in,int *nonzero,int ch){
   long i,k,l,s;
-  vorbis_look_residue0 *look=(vorbis_look_residue0 *)vl;
-  vorbis_info_residue0 *info=look->info;
+  vorbis_info_residue0 *info=(vorbis_info_residue0 *)vl;
+  codec_setup_info     *ci=(codec_setup_info *)vb->vd->vi->codec_setup;
+  codebook             *phrasebook=ci->book_param+info->groupbook;
 
   /* move all this setup out later */
   int samples_per_partition=info->grouping;
-  int partitions_per_word=look->phrasebook->dim;
+  int partitions_per_word=(int)phrasebook->dim;
   int max=(vb->pcmend*ch)>>1;
   int end=(info->end<max?info->end:max);
   int n=end-info->begin;
@@ -352,42 +306,53 @@ int res2_inverse(vorbis_block *vb,vorbis_look_residue *vl,
 
     int partvals=n/samples_per_partition;
     int partwords=(partvals+partitions_per_word-1)/partitions_per_word;
-    int **partword=(int **)_vorbis_block_alloc(vb,partwords*sizeof(*partword));
+    unsigned char *partword=(unsigned char *)
+      _vorbis_block_alloc(vb,(long)partwords*partitions_per_word*sizeof(*partword));
     int beginoff=info->begin/ch;
-    
+
     for(i=0;i<ch;i++)if(nonzero[i])break;
     if(i==ch)return(0); /* no nonzero vectors */
-    
+
     samples_per_partition/=ch;
-    
-    for(s=0;s<look->stages;s++){
+
+    for(s=0;s<info->stages;s++){
       for(i=0,l=0;i<partvals;l++){
-	
+	long base=l*(long)partitions_per_word;
+
 	if(s==0){
-	  /* fetch the partition word */
-	  int temp=vorbis_book_decode(look->phrasebook,&vb->opb);
+	  /* fetch the partition word and unpack it into partitions_per_word
+	     class indices, most-significant digit first (base info->partitions)
+	     - see _01inverse for the digit-decomposition rationale */
+	  int temp=vorbis_book_decode(phrasebook,&vb->opb);
+	  long div;
 	  if(temp==-1 || temp>=info->partvals)goto eopbreak;
-	  partword[l]=look->decodemap[temp];
-	  if(partword[l]==NULL)goto errout;
+
+	  div=1;
+	  for(k=partitions_per_word-2;k>=0;k--)div*=info->partitions;
+	  for(k=0;k<partitions_per_word;k++){
+	    long q=temp/div;
+	    partword[base+k]=(unsigned char)q;
+	    temp-=(int)(q*div);
+	    div/=info->partitions;
+	  }
 	}
 
 	/* now we decode residual values for the partitions */
-	for(k=0;k<partitions_per_word && i<partvals;k++,i++)
-	  if(info->secondstages[partword[l][k]]&(1<<s)){
-	    codebook *stagebook=look->partbooks[partword[l][k]][s];
-	    
-	    if(stagebook){
-	      if(vorbis_book_decodevv_add(stagebook,in,
-					  i*samples_per_partition+beginoff,ch,
-					  &vb->opb,
-					  samples_per_partition,-8)==-1)
-		goto eopbreak;
-	    }
+	for(k=0;k<partitions_per_word && i<partvals;k++,i++){
+	  int idx=partword[base+k];
+	  if(info->stagemasks[idx]&(1<<s)){
+	    codebook *stagebook=ci->book_param+info->stagebooks[(idx<<3)+s];
+
+	    if(vorbis_book_decodevv_add(stagebook,in,
+					i*samples_per_partition+beginoff,ch,
+					&vb->opb,
+					samples_per_partition,-8)==-1)
+	      goto eopbreak;
 	  }
-      } 
+	}
+      }
     }
   }
- errout:
  eopbreak:
   return(0);
 }
