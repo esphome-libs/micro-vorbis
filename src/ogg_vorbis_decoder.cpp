@@ -819,10 +819,64 @@ namespace {
 // Samples per lapout strip. Tremor's readout is now per-channel and non-consuming
 // (vorbis_synthesis_lapout), so PCM is drained in fixed-size chunks instead of one
 // pointer grab for the whole packet. 64 keeps the per-channel stack strip (256
-// bytes) and the downmix paths' 8-channel strip (2 KB worst case) small while
+// bytes) and the downmix path's 8-channel strip (2 KB worst case) small while
 // keeping the mdct_unroll_lap call count low.
 constexpr size_t LAPOUT_CHUNK = 64;
 }  // namespace
+
+// Whole-packet downmix readout: reconstruct up to 8 source planes strip by strip
+// and fold each strip to mono or stereo. Kept out of output_pcm as a noinline
+// function because the 8-plane strip array is by far the largest object on the
+// decode stack: stack frames are sized at compile time for the worst branch, so
+// inlined it would be reserved for every stream, including mono/native ones that
+// never take this path. Called once per packet, so the call cost is noise.
+__attribute__((noinline)) static void output_downmix(vorbis_dsp_state* vd, int16_t* pcm_output,
+                                                     size_t num_samples, uint8_t stream_channels,
+                                                     uint8_t output_channels) {
+    size_t samples_done = 0;
+    while (samples_done < num_samples) {
+        const size_t chunk = (num_samples - samples_done < LAPOUT_CHUNK)
+                                 ? (num_samples - samples_done)
+                                 : LAPOUT_CHUNK;
+        int16_t* out_chunk = pcm_output + samples_done * output_channels;
+
+        // downmix_stereo only ever reads plane indices 0-7 (channels 1-8
+        // explicitly, >8 falls back to just planes 0 and 1), so an 8-wide stack
+        // strip covers every stream_channels value; worst case is
+        // 8 * LAPOUT_CHUNK * sizeof(ogg_int32_t) = 2 KB.
+        ogg_int32_t strips[8][LAPOUT_CHUNK];
+        ogg_int32_t* strip_ptrs[8];
+        const uint8_t lap_channels = stream_channels < 8 ? stream_channels : 8;
+        for (uint8_t ch = 0; ch < lap_channels; ch++) {
+            vorbis_synthesis_lapout(vd, ch, strips[ch], static_cast<int>(chunk));
+            strip_ptrs[ch] = strips[ch];
+        }
+
+        if (output_channels == 1) {
+            // Downmix to mono: the half-sum of the full-precision stereo fold (see
+            // downmix_stereo). The +1 before the >>1 (the averaging divide) rounds
+            // to nearest.
+            unrolled_for(chunk, [&](size_t i) {
+                ogg_int32_t lo = 0, ro = 0;
+                downmix_stereo(strip_ptrs, i, stream_channels, lo, ro);
+                out_chunk[i] = clip_to_16((lo + ro + 1) >> 1);
+            });
+        } else {
+            // Downmix to stereo: write the (lo, ro) fold directly. output_channels
+            // is guaranteed to be 2 here.
+            unrolled_for(chunk, [&](size_t i) {
+                ogg_int32_t lo = 0, ro = 0;
+                downmix_stereo(strip_ptrs, i, stream_channels, lo, ro);
+                out_chunk[i * 2] = clip_to_16(lo);
+                out_chunk[i * 2 + 1] = clip_to_16(ro);
+            });
+        }
+
+        // Advance the readout window past this chunk before reconstructing the next.
+        vorbis_synthesis_read(vd, static_cast<int>(chunk));
+        samples_done += chunk;
+    }
+}
 
 OggVorbisResult OggVorbisDecoder::output_pcm(uint8_t* output, size_t output_size_bytes,
                                              size_t& bytes_written) {
@@ -860,77 +914,49 @@ OggVorbisResult OggVorbisDecoder::output_pcm(uint8_t* output, size_t output_size
     // the same math the old whole-packet-plane path used.
     int16_t* pcm_output = reinterpret_cast<int16_t*>(output);
 
-    size_t samples_done = 0;
-    while (samples_done < num_samples) {
-        const size_t chunk = (num_samples - samples_done < LAPOUT_CHUNK)
-                                 ? (num_samples - samples_done)
-                                 : LAPOUT_CHUNK;
-        int16_t* out_chunk = pcm_output + samples_done * output_channels;
-
-        if (this->sel_count_ > 0) {
-            // Raw channel selection: each output channel copies one source plane at
-            // unity (no mixing), or emits silence if that role is absent from the
-            // file's layout. sel_count_ <= 8, so output_channels <= 8 here.
+    if (this->sel_count_ == 0 && output_channels != stream_channels) {
+        // Downmix to mono or stereo, in a separate stack frame (see output_downmix).
+        output_downmix(&this->tremor_->vd, pcm_output, num_samples, stream_channels,
+                       output_channels);
+    } else {
+        size_t samples_done = 0;
+        while (samples_done < num_samples) {
+            const size_t chunk = (num_samples - samples_done < LAPOUT_CHUNK)
+                                     ? (num_samples - samples_done)
+                                     : LAPOUT_CHUNK;
+            int16_t* out_chunk = pcm_output + samples_done * output_channels;
             ogg_int32_t strip[LAPOUT_CHUNK];
-            for (uint8_t ch = 0; ch < output_channels; ch++) {
-                const int plane = role_to_plane(this->sel_[ch], stream_channels);
-                if (plane < 0) {
-                    // Role absent from this layout: emit silence for the channel.
-                    for (size_t i = 0; i < chunk; i++) {
-                        out_chunk[i * output_channels + ch] = 0;
+
+            if (this->sel_count_ > 0) {
+                // Raw channel selection: each output channel copies one source plane
+                // at unity (no mixing), or emits silence if that role is absent from
+                // the file's layout. sel_count_ <= 8, so output_channels <= 8 here.
+                for (uint8_t ch = 0; ch < output_channels; ch++) {
+                    const int plane = role_to_plane(this->sel_[ch], stream_channels);
+                    if (plane < 0) {
+                        // Role absent from this layout: emit silence for the channel.
+                        for (size_t i = 0; i < chunk; i++) {
+                            out_chunk[i * output_channels + ch] = 0;
+                        }
+                    } else {
+                        vorbis_synthesis_lapout(&this->tremor_->vd, plane, strip,
+                                                static_cast<int>(chunk));
+                        emit_plane(strip, out_chunk, chunk, output_channels, ch);
                     }
-                } else {
-                    vorbis_synthesis_lapout(&this->tremor_->vd, plane, strip,
-                                            static_cast<int>(chunk));
+                }
+            } else {
+                // Native copy: the output layout matches the stream, so each output
+                // channel is one source plane at unity.
+                for (uint8_t ch = 0; ch < output_channels; ch++) {
+                    vorbis_synthesis_lapout(&this->tremor_->vd, ch, strip, static_cast<int>(chunk));
                     emit_plane(strip, out_chunk, chunk, output_channels, ch);
                 }
             }
-        } else if (output_channels == stream_channels) {
-            // Native copy: the output layout matches the stream, so each output
-            // channel is one source plane at unity.
-            ogg_int32_t strip[LAPOUT_CHUNK];
-            for (uint8_t ch = 0; ch < output_channels; ch++) {
-                vorbis_synthesis_lapout(&this->tremor_->vd, ch, strip, static_cast<int>(chunk));
-                emit_plane(strip, out_chunk, chunk, output_channels, ch);
-            }
-        } else {
-            // Downmix to mono or stereo. downmix_stereo only ever reads plane
-            // indices 0-7 (channels 1-8 explicitly, >8 falls back to just planes 0
-            // and 1), so an 8-wide stack strip covers every stream_channels value;
-            // worst case is 8 * LAPOUT_CHUNK * sizeof(ogg_int32_t) = 2 KB.
-            ogg_int32_t strips[8][LAPOUT_CHUNK];
-            ogg_int32_t* strip_ptrs[8];
-            const uint8_t lap_channels = stream_channels < 8 ? stream_channels : 8;
-            for (uint8_t ch = 0; ch < lap_channels; ch++) {
-                vorbis_synthesis_lapout(&this->tremor_->vd, ch, strips[ch],
-                                        static_cast<int>(chunk));
-                strip_ptrs[ch] = strips[ch];
-            }
 
-            if (output_channels == 1) {
-                // Downmix to mono: the half-sum of the full-precision stereo fold (see
-                // downmix_stereo). The +1 before the >>1 (the averaging divide) rounds
-                // to nearest.
-                unrolled_for(chunk, [&](size_t i) {
-                    ogg_int32_t lo = 0, ro = 0;
-                    downmix_stereo(strip_ptrs, i, stream_channels, lo, ro);
-                    out_chunk[i] = clip_to_16((lo + ro + 1) >> 1);
-                });
-            } else {
-                // Downmix to stereo: write the (lo, ro) fold directly. output_channels
-                // is guaranteed to be 2 here.
-                unrolled_for(chunk, [&](size_t i) {
-                    ogg_int32_t lo = 0, ro = 0;
-                    downmix_stereo(strip_ptrs, i, stream_channels, lo, ro);
-                    out_chunk[i * 2] = clip_to_16(lo);
-                    out_chunk[i * 2 + 1] = clip_to_16(ro);
-                });
-            }
+            // Advance the readout window past this chunk before reconstructing the next.
+            vorbis_synthesis_read(&this->tremor_->vd, static_cast<int>(chunk));
+            samples_done += chunk;
         }
-
-        // Advance the readout window past this chunk before reconstructing the next.
-        vorbis_synthesis_read(&this->tremor_->vd, static_cast<int>(chunk));
-        samples_done += chunk;
     }
 
     // Note: start-priming and end-of-stream granule trimming are handled inside
