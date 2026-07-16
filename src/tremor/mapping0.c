@@ -336,7 +336,7 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
   for(i=0;i<vi->channels;i++){
     ogg_int32_t *pcm=vb->pcm[i];
     if(keep && !vorbis_keep_get(keep,i))continue;
-    mdct_backward(n,pcm,pcm);
+    mdct_backward_full(n,pcm,pcm);
   }
 
   /* window the data */
