@@ -34,13 +34,6 @@
 #define cPI1_8 (0x7641af3d)
 #endif
 
-extern void mdct_forward(int n, DATA_TYPE *in, DATA_TYPE *out);
-
-/* master-shaped (full-block) backward MDCT: transforms n values from
-   in into n values in out. Superseded by the lowmem functions below;
-   removed once mapping0.c no longer calls it. */
-extern void mdct_backward_full(int n, DATA_TYPE *in, DATA_TYPE *out);
-
 /* lowmem half-block backward MDCT: transforms n/2 values in in, in
    place. Does not perform the final deinterleave/expansion; see
    mdct_unroll_lap(). */

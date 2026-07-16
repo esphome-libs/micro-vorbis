@@ -32,7 +32,6 @@
 #include "mdct.h"
 #include "codec_internal.h"
 #include "codebook.h"
-#include "window.h"
 #include "registry.h"
 #include "misc.h"
 #include "block.h"
@@ -232,7 +231,6 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
   vorbis_dsp_state     *vd=vb->vd;
   vorbis_info          *vi=vd->vi;
   codec_setup_info     *ci=(codec_setup_info *)vi->codec_setup;
-  private_state        *b=(private_state *)vd->backend_state;
   vorbis_look_mapping0 *look=(vorbis_look_mapping0 *)l;
   vorbis_info_mapping0 *info=look->map;
 
@@ -240,9 +238,10 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
   long                  n=vb->pcmend=ci->blocksizes[vb->W];
 
   /* microVorbis: per-channel decode mask. NULL => keep everything. Only the
-     post-coupling synthesis (floor-apply / iMDCT / window) is gated; floor
-     decode, residue, and coupling above run for every channel so kept channels
-     stay bit-exact. */
+     post-coupling synthesis (floor-apply / iMDCT) is gated; floor decode,
+     residue, and coupling above run for every channel so kept channels stay
+     bit-exact. Windowing/overlap-add is deferred to readout time
+     (vorbis_synthesis_lapout), which the same mask gates via mdctright. */
   const unsigned char  *keep=vd->channel_keep;
 
   ARENA_STACK(ogg_int32_t *, pcmbundle, vi->channels, vb);
@@ -250,13 +249,13 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
 
   ARENA_STACK(int, nonzero, vi->channels, vb);
   ARENA_STACK(void *, floormemo, vi->channels, vb);
-  
+
   /* time domain information decode (note that applying the
      information would have to happen later; we'll probably add a
      function entry to the harness for that later */
   /* NOT IMPLEMENTED */
 
-  /* recover the spectral envelope; store it in the PCM vector for now */
+  /* recover the spectral envelope; store it in the working vector for now */
   for(i=0;i<vi->channels;i++){
     int submap=info->chmuxlist[i];
     floormemo[i]=look->floor_func[submap]->
@@ -264,16 +263,16 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
     if(floormemo[i])
       nonzero[i]=1;
     else
-      nonzero[i]=0;      
-    memset(vb->pcm[i],0,sizeof(*vb->pcm[i])*n/2);
+      nonzero[i]=0;
+    memset(vd->work[i],0,sizeof(*vd->work[i])*n/2);
   }
 
   /* channel coupling can 'dirty' the nonzero listing */
   for(i=0;i<info->coupling_steps;i++){
     if(nonzero[info->coupling_mag[i]] ||
        nonzero[info->coupling_ang[i]]){
-      nonzero[info->coupling_mag[i]]=1; 
-      nonzero[info->coupling_ang[i]]=1; 
+      nonzero[info->coupling_mag[i]]=1;
+      nonzero[info->coupling_ang[i]]=1;
     }
   }
 
@@ -286,23 +285,23 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
 	  zerobundle[ch_in_bundle]=1;
 	else
 	  zerobundle[ch_in_bundle]=0;
-	pcmbundle[ch_in_bundle++]=vb->pcm[j];
+	pcmbundle[ch_in_bundle++]=vd->work[j];
       }
     }
-    
+
     look->residue_func[i]->inverse(vb,look->residue_look[i],
 				   pcmbundle,zerobundle,ch_in_bundle);
   }
 
   /* channel coupling */
   for(i=info->coupling_steps-1;i>=0;i--){
-    ogg_int32_t *pcmM=vb->pcm[info->coupling_mag[i]];
-    ogg_int32_t *pcmA=vb->pcm[info->coupling_ang[i]];
-    
+    ogg_int32_t *pcmM=vd->work[info->coupling_mag[i]];
+    ogg_int32_t *pcmA=vd->work[info->coupling_ang[i]];
+
     for(j=0;j<n/2;j++){
       ogg_int32_t mag=pcmM[j];
       ogg_int32_t ang=pcmA[j];
-      
+
       if(mag>0)
 	if(ang>0){
 	  pcmM[j]=mag;
@@ -324,31 +323,21 @@ static int mapping0_inverse(vorbis_block *vb,vorbis_look_mapping *l){
 
   /* compute and apply spectral envelope */
   for(i=0;i<vi->channels;i++){
-    ogg_int32_t *pcm=vb->pcm[i];
+    ogg_int32_t *pcm=vd->work[i];
     int submap=info->chmuxlist[i];
     if(keep && !vorbis_keep_get(keep,i))continue;
     look->floor_func[submap]->
       inverse2(vb,look->floor_look[submap],floormemo[i],pcm);
   }
 
-  /* transform the PCM data; takes PCM vector, vb; modifies PCM vector */
-  /* only MDCT right now.... */
+  /* transform the working vector in place (half-block iMDCT; the final
+     deinterleave/expansion + windowing/overlap-add happens later, at PCM
+     readout - see mdct_unroll_lap). A !nonzero channel's plane is already
+     all-zero (memset above, residue skipped), and the MDCT of an all-zero
+     input is all-zero, so no separate zero-fill is needed here. */
   for(i=0;i<vi->channels;i++){
-    ogg_int32_t *pcm=vb->pcm[i];
     if(keep && !vorbis_keep_get(keep,i))continue;
-    mdct_backward_full(n,pcm,pcm);
-  }
-
-  /* window the data */
-  for(i=0;i<vi->channels;i++){
-    ogg_int32_t *pcm=vb->pcm[i];
-    if(keep && !vorbis_keep_get(keep,i))continue;
-    if(nonzero[i])
-      _vorbis_apply_window(pcm,b->window,ci->blocksizes,vb->lW,vb->W,vb->nW);
-    else
-      for(j=0;j<n;j++)
-	pcm[j]=0;
-
+    mdct_backward(n,vd->work[i]);
   }
 
   /* all done! */

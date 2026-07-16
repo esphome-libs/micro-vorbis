@@ -88,19 +88,31 @@ typedef struct vorbis_dsp_state{
   int analysisp;
   vorbis_info *vi;
 
-  ogg_int32_t **pcm;
-  ogg_int32_t **pcmret;
-  int      pcm_storage;
-  int      pcm_current;
-  int      pcm_returned;
+  /* microVorbis: lowmem synthesis buffers (see block.c _vds_init and
+     src/tremor/mdct.h). work[i] holds channel i's n1/2 half-transform plane:
+     mapping0_inverse writes the floor-applied spectrum there, then
+     mdct_backward() runs the half-block iMDCT in place. Residue decode and
+     channel coupling touch every channel, so work[] is allocated for ALL
+     channels regardless of channel_keep. mdctright[i] holds the n1/4 overlap
+     tail mdct_shift_right() saves at the start of the NEXT packet's decode
+     (synthesis.c), consumed by mdct_unroll_lap() at readout
+     (vorbis_synthesis_lapout). Only kept channels are allocated; NULL for
+     dropped (readout never touches them). */
+  ogg_int32_t **work;
+  ogg_int32_t **mdctright;
 
-  int  preextrapolate;
+  /* microVorbis: readout window into the current frame, in samples.
+     out_begin==-1 means priming (no block decoded yet, nothing to read).
+     out_begin==out_end means the current frame is fully drained. Replaces the
+     old pcm_current/pcm_returned double-buffer indices; see
+     vorbis_synthesis_pcmavail/_lapout/_read. */
+  int out_begin;
+  int out_end;
+
   int  eofflag;
 
   long lW;
   long W;
-  long nW;
-  long centerW;
 
   ogg_int64_t granulepos;
   ogg_int64_t sequence;
@@ -109,22 +121,24 @@ typedef struct vorbis_dsp_state{
 
   /* microVorbis: per-channel decode mask for the channel-selection
      optimization. A VORBIS_KEEP_BYTES(vi->channels) bitmask (see vorbis_keep_*
-     above); a clear bit skips that channel's floor-apply / iMDCT / window
-     (mapping0_inverse) and overlap-add (vorbis_synthesis_blockin). The entropy
-     decode + channel coupling always run for every channel, so kept channels
-     stay bit-exact. Fixed at init: defaults to all-set, or to the mask passed to
-     vorbis_synthesis_init_ex (dropped channels are never allocated). It is
-     immutable for the stream (fixed once via vorbis_synthesis_init_ex) because
-     it gates arena-owned history buffers. */
+     above); a clear bit skips that channel's floor-apply / iMDCT
+     (mapping0_inverse) and its lap/overlap-add reconstruction
+     (vorbis_synthesis_lapout only reconstructs kept channels; mdctright is
+     NULL for the rest). The entropy decode + channel coupling always run for
+     every channel, so kept channels stay bit-exact. Fixed at init: defaults to
+     all-set, or to the mask passed to vorbis_synthesis_init_ex (dropped
+     channels are never allocated). It is immutable for the stream (fixed once
+     via vorbis_synthesis_init_ex) because it gates arena-owned buffers. */
   unsigned char *channel_keep;
 
   /* microVorbis: single pre-sized arena holding every DSP-setup allocation
-     (private_state, the pcm/pcmret/channel_keep pointer arrays, each kept
-     channel's PCM history buffer, b->mode, and all mode/floor/residue lookups).
-     Sized once by _vorbis_dsp_arena_compute_size() in block.c and filled by bump
-     allocation during _vds_init, collapsing dozens-to-thousands of small mallocs
-     into one. This is the entire DSP heap footprint: vorbis_dsp_clear releases
-     it in a single free. */
+     (private_state, the work/mdctright/channel_keep pointer arrays, every
+     channel's work[] plane, each kept channel's mdctright[] tail, b->mode, and
+     all mode/floor/residue lookups). Sized once by
+     _vorbis_dsp_arena_compute_size() in block.c and filled by bump allocation
+     during _vds_init, collapsing dozens-to-thousands of small mallocs into
+     one. This is the entire DSP heap footprint: vorbis_dsp_clear releases it
+     in a single free. */
   void  *setup_arena_data;      /* Pre-allocated arena buffer */
   long   setup_arena_capacity;  /* Total arena size in bytes */
   long   setup_arena_used;      /* Current bump pointer offset */
@@ -132,9 +146,8 @@ typedef struct vorbis_dsp_state{
 
 typedef struct vorbis_block{
   /* necessary stream state for linking to the framing abstraction */
-  ogg_int32_t  **pcm;       /* this is a pointer into local storage */ 
   oggpack_buffer opb;
-  
+
   long  lW;
   long  W;
   long  nW;
@@ -189,8 +202,9 @@ extern int      vorbis_synthesis_headerin(vorbis_info *vi,ogg_packet *op);
 
 /* microVorbis: initialize synthesis state, with `keep` selecting which channels
    to allocate and decode. It is a VORBIS_KEEP_BYTES(n) bitmask (n == vi->channels;
-   see vorbis_keep_*); a clear bit drops that channel, so its PCM history buffer
-   costs nothing. The mask is fixed here and immutable for the stream (it gates
+   see vorbis_keep_*); a clear bit drops that channel, so its mdctright overlap
+   tail costs nothing (its work[] plane is still allocated; residue/coupling
+   need it). The mask is fixed here and immutable for the stream (it gates
    arena-owned buffers). Pass keep=NULL (any n) to keep every channel. This is the
    fork's only synthesis-init entry point; upstream's plain vorbis_synthesis_init()
    was removed. */
@@ -200,7 +214,22 @@ extern int      vorbis_synthesis_restart(vorbis_dsp_state *v);
 extern int      vorbis_synthesis(vorbis_block *vb,ogg_packet *op);
 extern int      vorbis_synthesis_trackonly(vorbis_block *vb,ogg_packet *op);
 extern int      vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb);
-extern int      vorbis_synthesis_pcmout(vorbis_dsp_state *v,ogg_int32_t ***pcm);
+
+/* microVorbis: lowmem synthesis readout API (replaces vorbis_synthesis_pcmout,
+   which returned planar pointers directly into arena-owned history buffers).
+   Reconstruction is deferred to readout time via mdct_unroll_lap(); the caller
+   pulls one channel's worth of samples at a time into its own buffer. */
+
+/* Pending finalized samples not yet consumed by vorbis_synthesis_read. */
+extern int      vorbis_synthesis_pcmavail(vorbis_dsp_state *v);
+
+/* Reconstruct up to `samples` pending samples of channel ch into out (raw
+   s7.24 int32, stride 1). Non-consuming: repeated calls return the same data
+   until vorbis_synthesis_read advances the readout window, so a caller can
+   retry after an undersized output buffer without losing samples. Returns the
+   count written, or OV_EINVAL for an out-of-range or non-kept channel. */
+extern int      vorbis_synthesis_lapout(vorbis_dsp_state *v,int ch,ogg_int32_t *out,int samples);
+
 extern int      vorbis_synthesis_read(vorbis_dsp_state *v,int samples);
 extern long     vorbis_packet_blocksize(vorbis_info *vi,ogg_packet *op);
 
