@@ -215,7 +215,7 @@ Heap use depends heavily on the encoded file: sample rate, channel count, and th
 
 | Allocation | Size | Notes |
 | ---------- | ---- | ----- |
-| `Decoder state` | ~10-40KB | Tremor state: PCM history and decode/setup arenas. ~10KB mono/low-rate, ~40KB 48kHz stereo, more for multichannel; scales with block size and channels (PCM history dominates) |
+| `Decoder state` | ~11-58KB | Tremor state: block/setup decode arenas, including the per-channel synthesis buffers (blocksize/2 + blocksize/4 int32 per channel). ~11KB mono, ~19KB 44.1/48kHz stereo, ~58KB 7.1; scales with block size and channels |
 | `Demuxer buffers` | ~5-10KB typical | Ogg packet assembly (zero-copy when possible); starts at 1KB, grows on demand to a 128KB cap |
 | `Codebook tables` | ~5-20KB typical | Compact Huffman decode trees and quantized value arrays; scales with codebook complexity. Placed separately via `MICRO_VORBIS_CODEBOOK_MEMORY_PREFERENCE` |
 | `Output buffer` | User-provided | Typically 2-8KB for stereo |

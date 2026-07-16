@@ -4,7 +4,7 @@ Internal documentation for developers working on the decoder internals. For the 
 
 ## Origins
 
-The decode core is a fork of [Tremor](https://gitlab.xiph.org/xiph/tremor) (`libvorbisidec`), Xiph.Org's fixed-point Vorbis decoder, modified directly in `src/tremor/` (no submodule, no patch step). The fork combines two upstream branches: the tree structure and most files come from **master**, while the codebook subsystem uses the design from the **lowmem** branch, hardened and optimized further (see [Tremor Fork Changes](#tremor-fork-changes)). The decode-only subset of `bitwise.c` plus two headers were folded in from [libogg](https://gitlab.xiph.org/xiph/ogg), so no external libogg dependency exists. The `OggVorbisDecoder` wrapper and Vorbis header parser are original to this project.
+The decode core is a fork of [Tremor](https://gitlab.xiph.org/xiph/tremor) (`libvorbisidec`), Xiph.Org's fixed-point Vorbis decoder, modified directly in `src/tremor/` (no submodule, no patch step). The fork combines two upstream branches: the codebook subsystem and the synthesis/MDCT subsystem use the design from the **lowmem** branch, hardened and optimized further, while the remaining tree structure and files come from **master** (see [Tremor Fork Changes](#tremor-fork-changes)). The decode-only subset of `bitwise.c` plus two headers were folded in from [libogg](https://gitlab.xiph.org/xiph/ogg), so no external libogg dependency exists. The `OggVorbisDecoder` wrapper and Vorbis header parser are original to this project.
 
 ## File Organization
 
@@ -46,24 +46,25 @@ STATE_EXPECT_IDENTIFICATION ──→ STATE_EXPECT_COMMENT ──→ STATE_STREA
 - **STATE_EXPECT_COMMENT**: Waits for the comment header. On the first decode call that supplies comment-packet data, the magic accumulator is reset and the state advances to STATE_STREAMING_COMMENT
 - **STATE_STREAMING_COMMENT**: The comment packet (which can carry arbitrarily large embedded data, e.g. cover art) is streamed past via the demuxer's `get_next_data()` without ever buffering it. Only the 7-byte magic is accumulated for validation; a 16-byte synthetic empty comment packet is then fed to Tremor to satisfy its header-ordering check
 - **STATE_EXPECT_SETUP**: Feeds the setup header to Tremor, builds the channel-keep mask when raw selection is active, and initializes the DSP state and block. Returns `STREAM_INFO_READY`
-- **STATE_DECODING**: Each audio packet runs `vorbis_synthesis()`, `vorbis_synthesis_blockin()`, then `vorbis_synthesis_pcmout()`, and the wrapper converts planar fixed-point PCM to interleaved `int16_t`
+- **STATE_DECODING**: Each audio packet runs `vorbis_synthesis()`, then `vorbis_synthesis_blockin()`, then drains PCM via `vorbis_synthesis_pcmavail()`/`vorbis_synthesis_lapout()` in fixed-size chunks, and the wrapper converts each chunk from fixed-point to interleaved `int16_t`
 
 All resource allocation is deferred to `decode()` (demuxer buffers on the first call, Tremor state during header processing), so construction never fails; an allocation failure surfaces as `ERROR_ALLOCATION_FAILED` and is recovered with `reset()`. If the output buffer is too small for a decoded block, the PCM stays inside the DSP state, `has_pending_pcm_` is set, and the next call drains it without consuming input. Start priming and end-of-stream granule trimming happen inside Tremor; the wrapper keeps no granule bookkeeping.
 
 ### Tremor Synthesis Pipeline
 
 ```text
-packet ──→ vorbis_synthesis ──────→ vorbis_synthesis_blockin ──→ vorbis_synthesis_pcmout
-           (block arena reset,       (overlap-add into DSP        (planar int32 PCM,
-            mode/window select,       PCM history, lag/trim)       s7.24 fixed point)
-            mapping0_inverse:
-            floor ─ residue ─
-            coupling ─ iMDCT)
+packet ──→ vorbis_synthesis ──────→ vorbis_synthesis_blockin ──→ vorbis_synthesis_lapout
+           (block arena reset,       (bookkeeping only: lW/W,      (per readout chunk:
+            mode/window select,       granulepos/sample_count,      mdct_unroll_lap windows
+            mapping0_inverse:         opens the out_begin/          and overlap-adds
+            floor ─ residue ─         out_end readout window)       vd->work against the
+            coupling ─ half-block                                   saved vd->mdctright
+            iMDCT into vd->work)                                    tail, s7.24 fixed point)
 ```
 
 ## Output Conversion
 
-Tremor emits planar 32-bit PCM in s7.24 fixed point (full scale ±1.0 = ±2^24, so `>> 9` lands in int16 range); the wrapper produces interleaved 16-bit PCM via one of three paths in `output_pcm()`:
+Tremor reconstructs 32-bit PCM in s7.24 fixed point (full scale ±1.0 = ±2^24, so `>> 9` lands in int16 range) on demand via `vorbis_synthesis_lapout()`; the wrapper pulls each channel's samples in fixed-size strips (`LAPOUT_CHUNK`, 64 samples) rather than grabbing a whole-packet plane pointer, and produces interleaved 16-bit PCM via one of three paths in `output_pcm()`:
 
 - **Native copy** (output channels == stream channels): per-plane 4-sample unrolled loop; adds a half-LSB bias before the truncating `>> 9` so conversion rounds to nearest, then saturates with `clip_to_16()`
 - **Smart downmix** (constructor `channels` = 1 or 2): `downmix_stereo()` folds any 1-8 channel Vorbis layout (spec channel order, section 4.3.9) to a stereo pair per ITU-R BS.775: fronts weighted 1.0, center/surround 0.7071 (-3 dB), LFE dropped, then a per-layout normalization gain `1/(sum of one output's weights)` so a full-scale mix cannot clip. The mix runs in two `mulhi()` stages (high word of a 32x32 multiply, a single `MULSH` on Xtensa): Q27 weights produce Q19 terms summed unclamped in int32 (4 guard bits below the output LSB), then a Q28 gain lands the sum in 16-bit range. Mono and stereo sources keep a one-stage Q23 unity form whose truncation matches the native copy's `>> 9`. Mono output is the rounded half-sum of the stereo pair
@@ -82,19 +83,28 @@ Upstream master unpacks codebooks in two steps: a heap `static_codebook` first, 
 - The Huffman tree is a packed `dec_table` with per-book node size (1/2/4 bytes), decoded by a tree walk; there are no first-table acceleration arrays
 - There is no precomputed `valuelist`; quantized values are dequantized on the fly during residue decode from `q_min`/`q_del`/`q_bits`/`q_pack` computed once at unpack
 
+### Lowmem Synthesis Subsystem
+
+Upstream master's backward MDCT produces a full block directly, and synthesis holds two full-block PCM copies (`vb->pcm` in the block arena, `v->pcm[i]` history in the DSP arena) for overlap-add. The fork instead uses the lowmem branch's half-block transform and buffer scheme, because persistent PCM state is the other dominant piece of long-lived decoder RAM:
+
+- `mdct_backward` transforms `n/2` values in place; the final deinterleave, windowing, and overlap-add are deferred to `mdct_unroll_lap()`, run once per readout chunk instead of once per decoded block
+- Persistent state per kept channel drops to `work[i]` (`blocksizes[1]/2` int32s, all channels - residue/coupling touch every channel) plus `mdctright[i]` (`blocksizes[1]/4` int32s, kept channels only): `3/4 * blocksizes[1]` versus the old `2 * blocksizes[1]`, e.g. 6 KB vs 16 KB per channel at blocksize 2048
+- `vorbis_synthesis_pcmout` (plane passback) is replaced by `vorbis_synthesis_pcmavail`/`_lapout` (non-consuming, per-channel, reconstructs on demand); the wrapper strip-mines readout instead of grabbing a whole-packet plane pointer
+- Two upstream-lowmem bugs were fixed while porting: a truncation-order bug in the cross-lap window/overlap-add, and an off-by-one in the MDCT's last cross-product that corrupted every 4th sample of blocksize-8192 streams (see [tremor/CHANGES.md](tremor/CHANGES.md))
+
 ### Memory Architecture
 
 Upstream Tremor does hundreds of small heap allocations per stream and more per frame. The fork consolidates the decoder into three memory pools, each with its own ESP-IDF placement policy (`custom_allocator.h` + Kconfig):
 
-1. **Block arena** (`vorbis_block`): a single pre-sized arena (`arena_data`/`arena_capacity`/`arena_used`) replaces upstream's chained per-frame allocator. `_vorbis_arena_compute_size()` in `block.c` sizes it once from the codec setup; `_vorbis_block_ripcord()` resets it each frame by zeroing `arena_used`. The `ARENA_STACK` macro replaces decode-path `alloca` use in `mapping0.c` and `res012.c`. The alloc/ripcord helpers are `static inline` in `block.h` so the hot path inlines them
-2. **DSP setup arena** (`vorbis_dsp_state`): upstream's original DSP init performed ~240 separate allocations on a typical stereo stream (private state, pointer arrays, per-channel PCM history, every floor/residue/mapping lookup). The fork computes the total up front through an `arena_size()` callback on each backend vtable that mirrors its `*_look` allocations exactly, then carves everything, including the PCM history buffers, from one allocation. `vorbis_dsp_clear` is a single free; allocation failure is one checkable point
+1. **Block arena** (`vorbis_block`): a single pre-sized arena (`arena_data`/`arena_capacity`/`arena_used`) replaces upstream's chained per-frame allocator. `_vorbis_arena_compute_size()` in `block.c` sizes it once from the codec setup; `_vorbis_block_ripcord()` resets it each frame by zeroing `arena_used`. The `ARENA_STACK` macro replaces decode-path `alloca` use in `mapping0.c` and `res012.c`. No PCM sample storage lives here: the per-channel half-transform and overlap-tail buffers moved to the DSP setup arena when the synthesis subsystem switched to the lowmem buffer scheme (see item 2). The alloc/ripcord helpers are `static inline` in `block.h` so the hot path inlines them
+2. **DSP setup arena** (`vorbis_dsp_state`): upstream's original DSP init performed ~240 separate allocations on a typical stereo stream (private state, pointer arrays, per-channel PCM history, every floor/residue/mapping lookup). The fork computes the total up front through an `arena_size()` callback on each backend vtable that mirrors its `*_look` allocations exactly, then carves everything from one allocation, including the persistent per-channel synthesis state: `work[i]` (`blocksizes[1]/2` int32s, the half-transform plane `mapping0_inverse` writes into and `mdct_backward` transforms in place) is allocated for every channel, since residue decode and channel coupling touch every channel regardless of selection, while `mdctright[i]` (`blocksizes[1]/4` int32s, the overlap tail `mdct_unroll_lap` reads at readout) is allocated only for kept channels. A kept channel therefore costs `3/4 * blocksizes[1]` int32s of persistent state - 6 KB at blocksize 2048, versus 16 KB under the old two-buffer scheme (a full-block `vb->pcm` in the block arena plus a full-block `v->pcm` history in the DSP arena). `vorbis_dsp_clear` is a single free; allocation failure is one checkable point
 3. **Codebook heap** (`vorbis_info`): the long-lived decode tables go through dedicated `_ogg_codebook_malloc`/`_ogg_codebook_calloc` macros with an independent Kconfig placement policy defaulting to prefer-internal-RAM, because they are read with random-access patterns on the hot path. Everything else defaults to prefer-PSRAM (without `CONFIG_SPIRAM`, all three pools default to internal-only)
 
 Three related decoder-slimming changes:
 
 - **Right-sized setup structs**: the spec-maximum fixed arrays in the parsed setup structs (`codec_setup_info`'s eight `[64]` mode/map/time/floor/residue tables, `vorbis_info_mapping0`'s channel and coupling arrays, `vorbis_info_residue0`'s stage and book lists) are heap-allocated to the parsed counts, each validated against a compile-time cap equal to the old fixed size. Because the tables no longer carry spec-max slack, the packet-supplied mode index is bounds-checked in `synthesis.c` before use (see `tremor/CHANGES.md`)
 - **Comment machinery removed**: the `vorbis_comment` struct, its init/clear/query API, and its per-stream allocations are gone. The decoder validates and skips the comment packet; the wrapper streams the real packet past without buffering (see the state machine above). Comment retrieval is intentionally unsupported
-- **Per-channel decode mask**: `vorbis_synthesis_init_ex()` fixes a channel-keep mask before the arena is sized, so when the wrapper's raw channel selection is active, unkept channels skip floor-apply, the inverse MDCT (the dominant cost), windowing, and overlap-add, and their PCM history buffers are never allocated. Entropy decode and channel coupling still run for all channels (residue bits are interleaved and coupling mixes channel pairs, so neither is skippable), which keeps kept channels bit-exact versus a full decode
+- **Per-channel decode mask**: `vorbis_synthesis_init_ex()` fixes a channel-keep mask before the arena is sized, so when the wrapper's raw channel selection is active, unkept channels skip floor-apply, the half-block iMDCT (the dominant cost), the overlap-tail save (`mdct_shift_right`), and the window/overlap-add reconstruction at readout (`vorbis_synthesis_lapout` rejects a non-kept channel with `OV_EINVAL`). Only their `mdctright` overlap-tail buffer is skipped - their `work` plane is still allocated, since residue decode and coupling write into every channel's plane. Entropy decode and channel coupling still run for all channels (residue bits are interleaved and coupling mixes channel pairs, so neither is skippable), which keeps kept channels bit-exact versus a full decode
 
 ### Bitstream Hardening
 

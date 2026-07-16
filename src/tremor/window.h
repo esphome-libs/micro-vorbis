@@ -15,13 +15,19 @@
 
  ********************************************************************/
 
+/********************************************************************
+ *                                                                  *
+ * MODIFIED 2026 BY KEVIN AHRENDT FOR microVorbis.                  *
+ *                                                                  *
+ * MODIFICATIONS ARE LICENSED UNDER THE SAME BSD-3-CLAUSE TERMS     *
+ * AS THE ORIGINAL; SEE 'COPYING'. SEE 'src/tremor/CHANGES.md'      *
+ * FOR DETAILS OF THE CHANGES.                                      *
+ *                                                                  *
+ ********************************************************************/
+
 #ifndef _V_WINDOW_
 #define _V_WINDOW_
 
 extern const void *_vorbis_window(int type,int left);
-extern void _vorbis_apply_window(ogg_int32_t *d,const void *window[2],
-				 long *blocksizes,
-				 int lW,int W,int nW);
-
 
 #endif
