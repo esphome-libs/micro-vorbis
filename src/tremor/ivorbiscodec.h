@@ -85,7 +85,6 @@ typedef struct vorbis_info{
    analysis/synthesis state.  The DSP state belongs to a specific
    logical bitstream ****************************************************/
 typedef struct vorbis_dsp_state{
-  int analysisp;
   vorbis_info *vi;
 
   /* microVorbis: lowmem synthesis buffers (see block.c _vds_init and

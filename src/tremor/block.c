@@ -48,43 +48,12 @@ static int ilog(unsigned int v){
   return(ret);
 }
 
-/* pcm accumulator examples (not exhaustive):
-
- <-------------- lW ---------------->
-                   <--------------- W ---------------->
-:            .....|.....       _______________         |
-:        .'''     |     '''_---      |       |\        |
-:.....'''         |_____--- '''......|       | \_______|
-:.................|__________________|_______|__|______|
-                  |<------ Sl ------>|      > Sr <     |endW
-                  |beginSl           |endSl  |  |endSr   
-                  |beginW            |endlW  |beginSr
-
-
-                      |< lW >|       
-                   <--------------- W ---------------->
-                  |   |  ..  ______________            |
-                  |   | '  `/        |     ---_        |
-                  |___.'___/`.       |         ---_____| 
-                  |_______|__|_______|_________________|
-                  |      >|Sl|<      |<------ Sr ----->|endW
-                  |       |  |endSl  |beginSr          |endSr
-                  |beginW |  |endlW                     
-                  mult[0] |beginSl                     mult[n]
-
- <-------------- lW ----------------->
-                          |<--W-->|                               
-:            ..............  ___  |   |                    
-:        .'''             |`/   \ |   |                       
-:.....'''                 |/`....\|...|                    
-:.........................|___|___|___|                  
-                          |Sl |Sr |endW    
-                          |   |   |endSr
-                          |   |beginSr
-                          |   |endSl
-			  |beginSl
-			  |beginW
-*/
+/* Synthesis buffering: mapping0_inverse writes each channel's floor-applied
+   spectrum into vd->work[i] and mdct_backward transforms it in place as a
+   half block; the previous block's overlap tail sits in vd->mdctright[i].
+   vorbis_synthesis_blockin only opens the out_begin/out_end readout window;
+   mdct_unroll_lap windows and overlap-adds on demand in
+   vorbis_synthesis_lapout. */
 
 /* block abstraction setup *********************************************/
 
