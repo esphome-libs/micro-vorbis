@@ -216,10 +216,10 @@ static vorbis_info_floor *floor1_unpack (vorbis_info *vi,oggpack_buffer *opb){
   return(NULL);
 }
 
-/* microVorbis: identity function - all decode-time precompute now lives in
-   vorbis_info_floor1, built once at unpack (see floor1_unpack). Keeps the
-   vorbis_func_floor vtable shape (look() is still called by mapping0_look
-   for every mode) without a separate DSP-arena allocation. */
+/* microVorbis: identity function: all decode-time precompute now lives in
+   vorbis_info_floor1, built once at unpack (see floor1_unpack). Nothing
+   calls it; the slot just keeps _floor_P[1] non-NULL. mapping0_look calls
+   look() for floor0 only (see backends.h's look_cache). */
 static vorbis_look_floor *floor1_look(vorbis_dsp_state *vd,vorbis_info_mode *mi,
                               vorbis_info_floor *in){
   (void)vd;(void)mi;

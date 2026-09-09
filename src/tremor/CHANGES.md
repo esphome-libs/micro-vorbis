@@ -47,6 +47,15 @@ handled:
   `decodep == 0` arm of `_vorbis_synthesis1` remain in `synthesis.c`
   (fast-forward without decode; blocksize lookup for seeking). They report 0%
   in fuzzer coverage by design.
+
+  `vorbis_synthesis_trackonly` does not interleave with real decodes: it
+  leaves `vd->work[]` untouched, but `blockin` still advances `v->lW`/`v->W`
+  (only the `out_begin`/`out_end` update is gated on `vb->pcmend`), so the
+  next real packet sizes its `mdct_shift_right` from a `vd->W` that no longer
+  describes `vd->work[]`. Both buffers are sized at `blocksizes[1]`, so the
+  result is wrong audio, not an overrun. Call `vorbis_synthesis_restart()`
+  before resuming decode. New with the lowmem port: master windowed from each
+  packet's own `vb->lW`/`vb->nW`.
 - **Upstream vtable slots stay populated**: the `*_free_look` hooks in
   `backends.h` are documented no-ops (the DSP arena frees everything in one
   shot) rather than NULL slots that would need a call-site guard.
@@ -225,6 +234,14 @@ lowmem's too, but hosted in master's `block.c`/`synthesis.c` and master's
   using `vd->W` (still the previous block's flag) to size the shift. Lowmem
   calls it unconditionally for every packet, including non-decoded ones, and
   has no channel mask.
+
+  This makes `vorbis_synthesis()` write DSP state, unlike master's, which
+  only touched the block-local `vb->pcm`. It runs before
+  `vorbis_synthesis_blockin`'s pending-samples `OV_EINVAL` guard, so that
+  guard no longer leaves the previous frame intact: a direct Tremor caller
+  must drain to `vorbis_synthesis_pcmavail() == 0` before the next packet.
+  Interleaving `vorbis_synthesis_trackonly` breaks it differently; see Dead
+  Code.
 - **`vorbis_synthesis_blockin` is bookkeeping-only** (`block.c`): it moves no
   PCM. It advances `lW`/`W`/`granulepos`/`sample_count` and opens the
   `out_begin`/`out_end` readout window (lowmem's names) that
