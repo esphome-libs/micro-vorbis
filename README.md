@@ -3,7 +3,7 @@
 [![CI](https://github.com/esphome-libs/micro-vorbis/actions/workflows/ci.yml/badge.svg)](https://github.com/esphome-libs/micro-vorbis/actions/workflows/ci.yml)
 [![Component Registry](https://components.espressif.com/components/esphome/micro-vorbis/badge.svg)](https://components.espressif.com/components/esphome/micro-vorbis)
 
-An Ogg Vorbis audio decoder optimized for embedded devices. Fixed-point decoder forked from Tremor (libvorbisidec), based on its `lowmem` branch, with an arena allocator for decode-path allocation. Designed as an ESP-IDF component with PSRAM support and Xtensa assembly optimizations. For internal architecture see [src/README.md](src/README.md); for the fork's changes relative to upstream Tremor see [src/tremor/CHANGES.md](src/tremor/CHANGES.md).
+An Ogg Vorbis audio decoder optimized for embedded devices. Fixed-point decoder forked from Tremor (libvorbisidec): the `master` tree with the `lowmem` branch's codebook and MDCT subsystems ported in, plus an arena allocator for decode-path allocation. Designed as an ESP-IDF component with PSRAM support and Xtensa assembly optimizations. For internal architecture see [src/README.md](src/README.md); for the fork's changes relative to upstream Tremor see [src/tremor/CHANGES.md](src/tremor/CHANGES.md).
 
 [![A project from the Open Home Foundation](https://www.openhomefoundation.org/badges/ohf-project.png)](https://www.openhomefoundation.org/)
 
