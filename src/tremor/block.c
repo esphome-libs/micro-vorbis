@@ -36,6 +36,7 @@
 #include "misc.h"
 #include "backends.h"
 #include "block.h"
+#include "mdct.h"
 
 static int ilog(unsigned int v){
   int ret=0;
@@ -47,43 +48,12 @@ static int ilog(unsigned int v){
   return(ret);
 }
 
-/* pcm accumulator examples (not exhaustive):
-
- <-------------- lW ---------------->
-                   <--------------- W ---------------->
-:            .....|.....       _______________         |
-:        .'''     |     '''_---      |       |\        |
-:.....'''         |_____--- '''......|       | \_______|
-:.................|__________________|_______|__|______|
-                  |<------ Sl ------>|      > Sr <     |endW
-                  |beginSl           |endSl  |  |endSr   
-                  |beginW            |endlW  |beginSr
-
-
-                      |< lW >|       
-                   <--------------- W ---------------->
-                  |   |  ..  ______________            |
-                  |   | '  `/        |     ---_        |
-                  |___.'___/`.       |         ---_____| 
-                  |_______|__|_______|_________________|
-                  |      >|Sl|<      |<------ Sr ----->|endW
-                  |       |  |endSl  |beginSr          |endSr
-                  |beginW |  |endlW                     
-                  mult[0] |beginSl                     mult[n]
-
- <-------------- lW ----------------->
-                          |<--W-->|                               
-:            ..............  ___  |   |                    
-:        .'''             |`/   \ |   |                       
-:.....'''                 |/`....\|...|                    
-:.........................|___|___|___|                  
-                          |Sl |Sr |endW    
-                          |   |   |endSr
-                          |   |beginSr
-                          |   |endSl
-			  |beginSl
-			  |beginW
-*/
+/* Synthesis buffering: mapping0_inverse writes each channel's floor-applied
+   spectrum into vd->work[i] and mdct_backward transforms it in place as a
+   half block; the previous block's overlap tail sits in vd->mdctright[i].
+   vorbis_synthesis_blockin only opens the out_begin/out_end readout window;
+   mdct_unroll_lap windows and overlap-adds on demand in
+   vorbis_synthesis_lapout. */
 
 /* block abstraction setup *********************************************/
 
@@ -96,12 +66,6 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
   long n=ci->blocksizes[1];
   long size=0;
   int i;
-
-  /* PCM pointer array: synthesis.c:76 */
-  size += channels * (long)sizeof(ogg_int32_t *);
-
-  /* PCM data per channel: synthesis.c:78 */
-  size += channels * n * (long)sizeof(ogg_int32_t);
 
   /* Floor allocations (worst case across all floor types) */
   {
@@ -122,15 +86,19 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
     size += channels * max_floor;
   }
 
-  /* Residue partword allocations: res012.c
-     _01inverse (types 0,1): ch * sizeof(int**) + ch * partwords * sizeof(int*)
-     res2_inverse (type 2):  partwords * sizeof(int*)
-     _01inverse caps `end` at pcmend/2; res2_inverse caps at pcmend*ch/2, so
-     res2 can have up to `ch` times the partitions of res0/res1. Track the
-     per-type worst case separately. */
+  /* Residue partword allocations: res012.c (lowmem classword decode, see
+     src/tremor/CHANGES.md)
+     _01inverse (types 0,1): ch * sizeof(uchar*) + ch * (partwords*dim) * sizeof(uchar)
+     res2_inverse (type 2):  (partwords*dim) * sizeof(uchar)
+     partword is now a flat per-channel byte array of partwords*partitions_per_word
+     (== dim) class indices, not an array of partwords pointers into a
+     setup-arena decodemap, so the per-word cost scales with dim (bytes), not
+     with a fixed pointer size. _01inverse caps `end` at pcmend/2; res2_inverse
+     caps at pcmend*ch/2, so res2 can have up to `ch` times the partitions of
+     res0/res1. Track the per-type worst case separately. */
   {
-    long max_partwords_01=0;
-    long max_partwords_2=0;
+    long max_bytes_01=0;
+    long max_bytes_2=0;
     for(i=0;i<ci->residues;i++){
       vorbis_info_residue0 *ri=(vorbis_info_residue0 *)ci->residue_param[i];
       long end_cap_01=n/2;
@@ -143,7 +111,8 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
       if(rn01>0){
         long partvals=rn01/ri->grouping;
         long pw=(partvals+dim-1)/dim;
-        if(pw>max_partwords_01) max_partwords_01=pw;
+        long bytes=pw*dim; /* one unsigned char per partition index */
+        if(bytes>max_bytes_01) max_bytes_01=bytes;
       }
 
       long end2=ri->end < end_cap_2 ? ri->end : end_cap_2;
@@ -151,28 +120,31 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
       if(rn2>0){
         long partvals=rn2/ri->grouping;
         long pw=(partvals+dim-1)/dim;
-        if(pw>max_partwords_2) max_partwords_2=pw;
+        long bytes=pw*dim;
+        if(bytes>max_bytes_2) max_bytes_2=bytes;
       }
     }
-    /* _01inverse: outer array + per-ch inner arrays. Its `end` cap is pcmend/2
-       (channel-independent) and it allocates `ch` inner arrays per submap, so
-       summed over all submaps the inner arrays total channels*max_partwords_01
-       (the submaps partition the channels) - already covered above. */
-    size += channels * (long)sizeof(int **);
-    size += channels * max_partwords_01 * (long)sizeof(int *);
-    /* res2: one partword array per submap. mapping0_inverse calls the residue
-       inverse once per submap (mapping0.c) and res2_inverse allocates its
-       partword array unconditionally (res012.c); the block arena is reset only
-       between packets, so every submap's array is live at once. Unlike res0/1,
-       res2's array size is channel-independent when info->end is the binding cap
-       (each submap then allocates the full max_partwords_2, not a ch-scaled
-       share), so a single reservation undercounts by the submap count. A submap
-       must carry >=1 channel to allocate (ch==0 -> n<=0 -> no alloc) and the
-       submaps partition the channels, so at most min(channels,submaps) res2
-       arrays coexist; submaps is a 4-bit field (<=16). Reserve that many. */
+    /* _01inverse: outer pointer array + per-ch inner byte arrays. Its `end` cap
+       is pcmend/2 (channel-independent) and it allocates `ch` inner arrays per
+       submap, so summed over all submaps the inner arrays total
+       channels*max_bytes_01 (the submaps partition the channels) - already
+       covered above. */
+    size += channels * (long)sizeof(unsigned char *);
+    size += channels * max_bytes_01;
+    /* res2: one partword byte array per submap. mapping0_inverse calls the
+       residue inverse once per submap (mapping0.c) and res2_inverse allocates
+       its partword array unconditionally (res012.c); the block arena is reset
+       only between packets, so every submap's array is live at once. Unlike
+       res0/1, res2's array size is channel-independent when info->end is the
+       binding cap (each submap then allocates the full max_bytes_2, not a
+       ch-scaled share), so a single reservation undercounts by the submap
+       count. A submap must carry >=1 channel to allocate (ch==0 -> n<=0 -> no
+       alloc) and the submaps partition the channels, so at most
+       min(channels,submaps) res2 arrays coexist; submaps is a 4-bit field
+       (<=16). Reserve that many. */
     {
       long max_res2_submaps = channels < 16 ? channels : 16;
-      size += max_res2_submaps * max_partwords_2 * (long)sizeof(int *);
+      size += max_res2_submaps * max_bytes_2;
     }
   }
 
@@ -187,9 +159,9 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
 
   /* The terms above are raw sizes, but _vorbis_block_alloc rounds every
      allocation up to ARENA_ALIGN, so allow (ARENA_ALIGN-1) of waste per
-     allocation. Per packet there are at most 4*channels + 5 allocations:
-       1          pcm pointer array        (synthesis.c)
-       channels   pcm data buffers         (synthesis.c)
+     allocation. Per packet there are at most 3*channels + 4 allocations
+     (PCM no longer lives in the block arena; see ivorbiscodec.h's
+     vorbis_dsp_state::work/mdctright):
        4          mapping bundles          (mapping0.c: pcm/zero/nonzero/floormemo)
        channels   floor memos              (floor0/1 inverse1)
        channels   residue inner arrays     (res012.c: res0/1 per-channel inner
@@ -200,7 +172,7 @@ static long _vorbis_arena_compute_size(vorbis_info *vi){
      The slack has to scale with channels (Vorbis allows up to 255): the
      decode path dereferences _vorbis_block_alloc's NULL return unchecked,
      so an undersized arena is a crash, not a clean failure. */
-  size += (4L * channels + 5) * (ARENA_ALIGN - 1);
+  size += (3L * channels + 4) * (ARENA_ALIGN - 1);
 
   return size;
 }
@@ -227,32 +199,45 @@ int vorbis_block_clear(vorbis_block *vb){
    _vorbis_dsp_arena_compute_size() is exact (it mirrors every allocation with
    the same ARENA_ALIGN rounding the bump allocator uses), so this is pure
    insurance against an overlooked site or platform sizeof drift; it is tiny
-   next to the arena itself (which is dominated by residue decodemaps). */
+   next to the arena itself. (Residue, floor1, and mapping0 no longer
+   contribute here: their look()s return the info pointer directly and their
+   arena_size()s are 0 - floor0 is the only backend whose look() still
+   allocates - see res012.c, floor1.c, mapping0.c and
+   src/tremor/CHANGES.md.) */
 #define DSP_ARENA_SAFETY 256
 
 /* Ceiling on the DSP setup arena. The arena is addressed with `long` offsets
    (setup_arena_used/_capacity) and handed to a single _ogg_malloc, so on the
    ILP32 target (ESP32, 32-bit long) it can never exceed 2^31-1 bytes. A crafted
-   header - many modes/submaps all pointing at one residue whose decodemap is
-   hundreds of MB (res012.c) - can drive _vorbis_dsp_arena_compute_size's mirror
-   total past that. Summed into a 32-bit long it would wrap to a small value,
-   _ogg_malloc would then succeed undersized, and res0_look's unchecked arena
-   allocations would scribble past the buffer. The total is computed in 64 bits
-   and any stream over this cap is rejected before the malloc. */
+   header - many modes/submaps fanning out into per-mode floor/mapping lookups -
+   can drive _vorbis_dsp_arena_compute_size's mirror total past that. Summed
+   into a 32-bit long it would wrap to a small value,
+   _ogg_malloc would then succeed undersized, and a backend look()'s unchecked
+   arena allocations would scribble past the buffer. The total is computed in
+   64 bits and any stream over this cap is rejected before the malloc. */
 #define DSP_ARENA_MAX_BYTES 0x7fffffffLL
 
 /* Compute the size of the DSP setup arena from codec_setup_info. Mirrors the
    top-level allocations in _vds_init and, through the per-backend arena_size
-   vtable entries, every mode/floor/residue lookup that mapping0_look builds.
-   Each term is rounded to ARENA_ALIGN exactly as _vorbis_setup_alloc rounds, so
-   for a correct mirror the return value equals the arena's final used watermark.
+   vtable entries, every floor/residue lookup mapping0_look builds. mapping0
+   itself no longer owns any arena state (vorbis_info_mapping0 is the "look");
+   floor1 and every residue backend are likewise identity look()s that
+   contribute 0. floor0 is the only backend whose look() still allocates
+   (linearmap/lsp_look, cached per blockflag on vorbis_info_floor0 - see
+   mapping0.c and backends.h), so it is the only nonzero term this loop
+   actually sums in practice. Each term is rounded to ARENA_ALIGN exactly as
+   _vorbis_setup_alloc rounds, so for a correct mirror the return value equals
+   the arena's final used watermark.
 
-   The per-channel PCM history buffers (v->pcm[i], pcm_storage int32s each) ARE
-   counted, but only for channels the caller keeps: `keep` is the per-channel
-   mask passed to vorbis_synthesis_init_ex (NULL means keep all). Because the
-   mask is fixed before the arena is sized, dropped channels are never allocated
-   at all, so there is nothing to free later and the whole DSP state collapses to
-   this single allocation. */
+   The per-channel work[] planes (n1/2 int32s each) are counted for ALL
+   channels: residue decode and channel coupling touch every channel, so
+   work[] is allocated regardless of `keep`. The per-channel mdctright[]
+   overlap tails (n1/4 int32s each) are counted only for channels the caller
+   keeps: `keep` is the per-channel mask passed to vorbis_synthesis_init_ex
+   (NULL means keep all). Because the mask is fixed before the arena is sized,
+   a dropped channel's mdctright is never allocated at all, so there is
+   nothing to free later and the whole DSP state collapses to this single
+   allocation. */
 /* Returns the mirrored arena size in 64-bit so a maliciously large mode/submap
    fan-out (each per-mode term is a valid long, but up to 64 modes * 16 submaps
    can sum past 2^31) cannot wrap; the caller enforces DSP_ARENA_MAX_BYTES. */
@@ -264,15 +249,21 @@ static ogg_int64_t _vorbis_dsp_arena_compute_size(vorbis_dsp_state *v,const unsi
   int i;
 
   size+=_vorbis_arena_round(sizeof(private_state));                 /* backend_state */
-  size+=_vorbis_arena_round(channels*(long)sizeof(ogg_int32_t *));  /* v->pcm */
-  size+=_vorbis_arena_round(channels*(long)sizeof(ogg_int32_t *));  /* v->pcmret */
+  size+=_vorbis_arena_round(channels*(long)sizeof(ogg_int32_t *));  /* v->work ptr array */
+  size+=_vorbis_arena_round(channels*(long)sizeof(ogg_int32_t *));  /* v->mdctright ptr array */
   size+=_vorbis_arena_round(VORBIS_KEEP_BYTES(channels));           /* v->channel_keep */
 
-  /* per-channel PCM history buffers, kept channels only */
+  /* v->work[i]: ALL channels, n1/2 int32s each */
   {
-    long pcmbytes=_vorbis_arena_round(ci->blocksizes[1]*(long)sizeof(ogg_int32_t));
+    long workbytes=_vorbis_arena_round((ci->blocksizes[1]/2)*(long)sizeof(ogg_int32_t));
+    size += channels * workbytes;
+  }
+
+  /* v->mdctright[i]: kept channels only, n1/4 int32s each */
+  {
+    long tailbytes=_vorbis_arena_round((ci->blocksizes[1]/4)*(long)sizeof(ogg_int32_t));
     for(i=0;i<channels;i++)
-      if(!keep || vorbis_keep_get(keep,i)) size+=pcmbytes;
+      if(!keep || vorbis_keep_get(keep,i)) size+=tailbytes;
   }
 
   size+=_vorbis_arena_round(ci->modes*(long)sizeof(vorbis_look_mapping *)); /* b->mode */
@@ -328,24 +319,31 @@ static int _vds_init(vorbis_dsp_state *v,vorbis_info *vi,const unsigned char *ke
   b->window[0]=_vorbis_window(0,ci->blocksizes[0]/2);
   b->window[1]=_vorbis_window(0,ci->blocksizes[1]/2);
 
-  v->pcm_storage=ci->blocksizes[1];
-  v->pcm=(ogg_int32_t **)_vorbis_setup_alloc(v,vi->channels*(long)sizeof(*v->pcm));
-  v->pcmret=(ogg_int32_t **)_vorbis_setup_alloc(v,vi->channels*(long)sizeof(*v->pcmret));
+  v->work=(ogg_int32_t **)_vorbis_setup_alloc(v,vi->channels*(long)sizeof(*v->work));
+  v->mdctright=(ogg_int32_t **)_vorbis_setup_alloc(v,vi->channels*(long)sizeof(*v->mdctright));
 
   /* microVorbis: per-channel decode mask, fixed at init. NULL keep = decode
      every channel (default, behavior unchanged). The mask is immutable for the
-     stream's life because the history buffers it gates are arena-owned. */
+     stream's life because the mdctright buffers it gates are arena-owned. */
   v->channel_keep=(unsigned char *)_vorbis_setup_calloc(v,VORBIS_KEEP_BYTES(vi->channels),1);
   for(i=0;i<vi->channels;i++)
     if(!keep || vorbis_keep_get(keep,i))vorbis_keep_set(v->channel_keep,i);
 
-  /* Per-channel PCM history now lives in the setup arena: only kept channels are
-     allocated, dropped channels get a NULL pointer (the blockin/pcmout paths
-     already guard on NULL / channel_keep). zeroed because overlap-add reads the
-     history before the first block writes it. */
+  /* work[i]: ALL channels, n1/2 int32s. Residue decode and channel coupling
+     touch every channel even when only some are kept, so every channel needs
+     a plane. Zeroed: mapping0_inverse memsets it per-block anyway, but a
+     dropped channel's plane is otherwise never written and mdct_shift_right
+     reads it unconditionally for kept channels' shift on the next packet. */
   for(i=0;i<vi->channels;i++)
-    v->pcm[i]=vorbis_keep_get(v->channel_keep,i)
-      ?(ogg_int32_t *)_vorbis_setup_calloc(v,v->pcm_storage,sizeof(*v->pcm[i]))
+    v->work[i]=(ogg_int32_t *)_vorbis_setup_calloc(v,ci->blocksizes[1]/2,sizeof(*v->work[i]));
+
+  /* mdctright[i]: kept channels only, n1/4 int32s. Dropped channels get a NULL
+     pointer (vorbis_synthesis_lapout rejects non-kept channels before
+     touching it). Zeroed: mdct_unroll_lap reads the tail before the first
+     block writes it (via mdct_shift_right). */
+  for(i=0;i<vi->channels;i++)
+    v->mdctright[i]=vorbis_keep_get(v->channel_keep,i)
+      ?(ogg_int32_t *)_vorbis_setup_calloc(v,ci->blocksizes[1]/4,sizeof(*v->mdctright[i]))
       :NULL;
 
   /* all 1 (large block) or 0 (small block) */
@@ -374,10 +372,9 @@ int vorbis_synthesis_restart(vorbis_dsp_state *v){
   ci=vi->codec_setup;
   if(!ci)return -1;
 
-  v->centerW=ci->blocksizes[1]/2;
-  v->pcm_current=v->centerW;
-  
-  v->pcm_returned=-1;
+  v->out_begin=-1;
+  v->out_end=-1;
+
   v->granulepos=-1;
   v->sequence=-1;
   ((private_state *)(v->backend_state))->sample_count=-1;
@@ -398,31 +395,35 @@ int vorbis_synthesis_init_ex(vorbis_dsp_state *v,vorbis_info *vi,
 
 void vorbis_dsp_clear(vorbis_dsp_state *v){
   if(v){
-    /* The entire DSP state (private_state, the pcm/pcmret/channel_keep pointer
-       arrays, every kept channel's PCM history buffer, b->mode, and every
-       mode/floor/residue lookup) lives in the single setup arena, released in
-       one free. The backend free_look hooks are no-ops for this reason. */
+    /* The entire DSP state (private_state, the work/mdctright/channel_keep
+       pointer arrays, every channel's work[] plane, every kept channel's
+       mdctright[] tail, b->mode, and every mode/floor/residue lookup) lives in
+       the single setup arena, released in one free. The backend free_look
+       hooks are no-ops for this reason. */
     if(v->setup_arena_data)_ogg_free(v->setup_arena_data);
 
     memset(v,0,sizeof(*v));
   }
 }
 
-/* Unlike in analysis, the window is only partially applied for each
-   block.  The time domain envelope is not yet handled at the point of
-   calling (as it relies on the previous block). */
-
+/* Bookkeeping only: no PCM is touched here. mapping0_inverse (via
+   mdct_backward) has already left the current block's half-transform in
+   vd->work[]; synthesis.c's mdct_shift_right has already saved the previous
+   block's tail into vd->mdctright[] before this ran. This just advances the
+   lW/W/granulepos/sample_count state and opens the readout window
+   (out_begin/out_end) that vorbis_synthesis_lapout reconstructs from on
+   demand. */
 int vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb){
   vorbis_info *vi=v->vi;
   codec_setup_info *ci=(codec_setup_info *)vi->codec_setup;
   private_state *b=v->backend_state;
-  int i,j;
 
-  if(v->pcm_current>v->pcm_returned  && v->pcm_returned!=-1)return(OV_EINVAL);
+  /* Don't accept a new block until the previous one's samples have been fully
+     read out. out_begin==-1 is priming (nothing pending yet), not this case. */
+  if(v->out_begin>-1 && v->out_begin<v->out_end)return(OV_EINVAL);
 
   v->lW=v->W;
   v->W=vb->W;
-  v->nW=-1;
 
   if((v->sequence==-1)||
      (v->sequence+1 != vb->sequence)){
@@ -431,122 +432,41 @@ int vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb){
   }
 
   v->sequence=vb->sequence;
-  
-  if(vb->pcm){  /* no pcm to process if vorbis_synthesis_trackonly 
-                   was called on block */
-    int n=ci->blocksizes[v->W]/2;
-    int n0=ci->blocksizes[0]/2;
-    int n1=ci->blocksizes[1]/2;
-    
-    int thisCenter;
-    int prevCenter;
-    
-    if(v->centerW){
-      thisCenter=n1;
-      prevCenter=0;
+
+  if(vb->pcmend){  /* pcmend==0 means vorbis_synthesis_trackonly was called on
+                       this block: bookkeeping only, nothing was decoded */
+    if(v->out_begin==-1){
+      /* first real block: establishes lap state, emits no samples yet */
+      v->out_begin=0;
+      v->out_end=0;
     }else{
-      thisCenter=0;
-      prevCenter=n1;
+      v->out_begin=0;
+      v->out_end=ci->blocksizes[v->lW]/4+ci->blocksizes[v->W]/4;
     }
-    
-    /* v->pcm is now used like a two-stage double buffer.  We don't want
-       to have to constantly shift *or* adjust memory usage.  Don't
-       accept a new block until the old is shifted out */
-    
-    /* overlap/add PCM */
-    
-    for(j=0;j<vi->channels;j++){
-      /* microVorbis: skip overlap/add + copy for channels the caller does not
-         want. Their per-block spectra were still entropy-decoded and coupled
-         (so kept channels are correct), but their PCM history is never built or
-         read. */
-      if(v->channel_keep && !vorbis_keep_get(v->channel_keep,j))continue;
-
-      /* the overlap/add section */
-      if(v->lW){
-	if(v->W){
-	  /* large/large */
-	  ogg_int32_t *pcm=v->pcm[j]+prevCenter;
-	  ogg_int32_t *p=vb->pcm[j];
-	  for(i=0;i<n1;i++)
-	    pcm[i]+=p[i];
-	}else{
-	  /* large/small */
-	  ogg_int32_t *pcm=v->pcm[j]+prevCenter+n1/2-n0/2;
-	  ogg_int32_t *p=vb->pcm[j];
-	  for(i=0;i<n0;i++)
-	    pcm[i]+=p[i];
-	}
-      }else{
-	if(v->W){
-	  /* small/large */
-	  ogg_int32_t *pcm=v->pcm[j]+prevCenter;
-	  ogg_int32_t *p=vb->pcm[j]+n1/2-n0/2;
-	  for(i=0;i<n0;i++)
-	    pcm[i]+=p[i];
-	  for(;i<n1/2+n0/2;i++)
-	    pcm[i]=p[i];
-	}else{
-	  /* small/small */
-	  ogg_int32_t *pcm=v->pcm[j]+prevCenter;
-	  ogg_int32_t *p=vb->pcm[j];
-	  for(i=0;i<n0;i++)
-	    pcm[i]+=p[i];
-	}
-      }
-      
-      /* the copy section */
-      {
-	ogg_int32_t *pcm=v->pcm[j]+thisCenter;
-	ogg_int32_t *p=vb->pcm[j]+n;
-	for(i=0;i<n;i++)
-	  pcm[i]=p[i];
-      }
-    }
-    
-    if(v->centerW)
-      v->centerW=0;
-    else
-      v->centerW=n1;
-    
-    /* deal with initial packet state; we do this using the explicit
-       pcm_returned==-1 flag otherwise we're sensitive to first block
-       being short or long */
-
-    if(v->pcm_returned==-1){
-      v->pcm_returned=thisCenter;
-      v->pcm_current=thisCenter;
-    }else{
-      v->pcm_returned=prevCenter;
-      v->pcm_current=prevCenter+
-	ci->blocksizes[v->lW]/4+
-	ci->blocksizes[v->W]/4;
-    }
-
   }
-    
+
   /* track the frame number... This is for convenience, but also
      making sure our last packet doesn't end with added padding.  If
      the last packet is partial, the number of samples we'll have to
      return will be past the vb->granulepos.
-     
+
      This is not foolproof!  It will be confused if we begin
      decoding at the last page after a seek or hole.  In that case,
      we don't have a starting point to judge where the last frame
      is.  For this reason, vorbisfile will always try to make sure
      it reads the last two marked pages in proper sequence */
-  
+
   if(b->sample_count==-1){
     b->sample_count=0;
   }else{
     b->sample_count+=ci->blocksizes[v->lW]/4+ci->blocksizes[v->W]/4;
   }
-    
+
   if(v->granulepos==-1){
     if(vb->granulepos!=-1){ /* only set if we have a position to set to */
-      
+
       v->granulepos=vb->granulepos;
-      
+
       /* is this a short page? */
       if(b->sample_count>v->granulepos){
 	/* corner case; if this is both the first and last audio page,
@@ -561,7 +481,7 @@ int vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb){
 
 	if(vb->eofflag){
 	  /* trim the end */
-	  /* no preceeding granulepos; assume we started at zero (we'd
+	  /* no preceding granulepos; assume we started at zero (we'd
 	     have to in a short single-page stream) */
 	  /* granulepos could be -1 due to a seek, but that would result
 	     in a long coun`t, not short count */
@@ -569,24 +489,24 @@ int vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb){
           /* Guard against corrupt/malicious frames that set EOP and
              a backdated granpos; don't rewind more samples than we
              actually have */
-          if(extra > v->pcm_current - v->pcm_returned)
-            extra = v->pcm_current - v->pcm_returned;
+          if(extra > v->out_end - v->out_begin)
+            extra = v->out_end - v->out_begin;
 
-	  v->pcm_current-=extra;
+	  v->out_end-=extra;
 	}else{
 	  /* trim the beginning */
-	  v->pcm_returned+=extra;
-	  if(v->pcm_returned>v->pcm_current)
-	    v->pcm_returned=v->pcm_current;
+	  v->out_begin+=extra;
+	  if(v->out_begin>v->out_end)
+	    v->out_begin=v->out_end;
 	}
-	
+
       }
-      
+
     }
   }else{
     v->granulepos+=ci->blocksizes[v->lW]/4+ci->blocksizes[v->W]/4;
     if(vb->granulepos!=-1 && v->granulepos!=vb->granulepos){
-      
+
       if(v->granulepos>vb->granulepos){
 	/* see the short-page case above: guard the subtraction against a
 	   'negative' (huge unsigned) granpos to avoid ogg_int64_t overflow */
@@ -600,10 +520,10 @@ int vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb){
             /* Guard against corrupt/malicious frames that set EOP and
                a backdated granpos; don't rewind more samples than we
                actually have */
-            if(extra > v->pcm_current - v->pcm_returned)
-              extra = v->pcm_current - v->pcm_returned;
+            if(extra > v->out_end - v->out_begin)
+              extra = v->out_end - v->out_begin;
 
-            v->pcm_current-=extra;
+            v->out_end-=extra;
 
 	  } /* else {Shouldn't happen *unless* the bitstream is out of
 	       spec.  Either way, believe the bitstream } */
@@ -612,34 +532,49 @@ int vorbis_synthesis_blockin(vorbis_dsp_state *v,vorbis_block *vb){
       v->granulepos=vb->granulepos;
     }
   }
-  
+
   /* Update, cleanup */
-  
+
   if(vb->eofflag)v->eofflag=1;
   return(0);
 }
 
-/* pcm==NULL indicates we just want the pending samples, no more */
-int vorbis_synthesis_pcmout(vorbis_dsp_state *v,ogg_int32_t ***pcm){
+/* Pending finalized samples not yet consumed by vorbis_synthesis_read. */
+int vorbis_synthesis_pcmavail(vorbis_dsp_state *v){
+  return (v->out_begin>-1 && v->out_begin<v->out_end) ? v->out_end-v->out_begin : 0;
+}
+
+/* Reconstruct up to `samples` pending samples of channel ch into out. Runs
+   the deferred iMDCT tail + window + overlap-add (mdct_unroll_lap) against
+   vd->work[ch] (current block) and vd->mdctright[ch] (previous block's
+   tail); non-consuming, so a caller can call this repeatedly (e.g. retrying
+   after an undersized output buffer) until vorbis_synthesis_read advances
+   out_begin. */
+int vorbis_synthesis_lapout(vorbis_dsp_state *v,int ch,ogg_int32_t *out,int samples){
   vorbis_info *vi=v->vi;
-  if(v->pcm_returned>-1 && v->pcm_returned<v->pcm_current){
-    if(pcm){
-      int i;
-      for(i=0;i<vi->channels;i++)
-	/* microVorbis: channels whose history buffer was released (not kept)
-	   report a NULL pointer rather than NULL+offset arithmetic. The wrapper
-	   never reads these planes in selection mode. */
-	v->pcmret[i]=v->pcm[i]?v->pcm[i]+v->pcm_returned:NULL;
-      *pcm=v->pcmret;
-    }
-    return(v->pcm_current-v->pcm_returned);
-  }
-  return(0);
+  codec_setup_info *ci=(codec_setup_info *)vi->codec_setup;
+  private_state *b=(private_state *)v->backend_state;
+  int avail,n;
+
+  if(ch<0 || ch>=vi->channels)return(OV_EINVAL);
+  if(!v->channel_keep || !vorbis_keep_get(v->channel_keep,ch))return(OV_EINVAL);
+
+  avail=(v->out_begin>-1 && v->out_begin<v->out_end) ? v->out_end-v->out_begin : 0;
+  n=samples<avail ? samples : avail;
+  if(n<=0)return(0);
+
+  mdct_unroll_lap(ci->blocksizes[0],ci->blocksizes[1],
+		  (int)v->lW,(int)v->W,
+		  v->work[ch],v->mdctright[ch],
+		  (const LOOKUP_T *)b->window[0],(const LOOKUP_T *)b->window[1],
+		  out,1,
+		  v->out_begin,v->out_begin+n);
+  return(n);
 }
 
 int vorbis_synthesis_read(vorbis_dsp_state *v,int samples){
-  if(samples && v->pcm_returned+samples>v->pcm_current)return(OV_EINVAL);
-  v->pcm_returned+=samples;
+  if(samples && v->out_begin+samples>v->out_end)return(OV_EINVAL);
+  v->out_begin+=samples;
   return(0);
 }
 

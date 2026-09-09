@@ -3,7 +3,7 @@
 [![CI](https://github.com/esphome-libs/micro-vorbis/actions/workflows/ci.yml/badge.svg)](https://github.com/esphome-libs/micro-vorbis/actions/workflows/ci.yml)
 [![Component Registry](https://components.espressif.com/components/esphome/micro-vorbis/badge.svg)](https://components.espressif.com/components/esphome/micro-vorbis)
 
-An Ogg Vorbis audio decoder optimized for embedded devices. Fixed-point decoder forked from Tremor (libvorbisidec), based on its `lowmem` branch, with an arena allocator for decode-path allocation. Designed as an ESP-IDF component with PSRAM support and Xtensa assembly optimizations. For internal architecture see [src/README.md](src/README.md); for the fork's changes relative to upstream Tremor see [src/tremor/CHANGES.md](src/tremor/CHANGES.md).
+An Ogg Vorbis audio decoder optimized for embedded devices. Fixed-point decoder forked from Tremor (libvorbisidec): the `master` tree with the `lowmem` branch's codebook and MDCT subsystems ported in, plus an arena allocator for decode-path allocation. Designed as an ESP-IDF component with PSRAM support and Xtensa assembly optimizations. For internal architecture see [src/README.md](src/README.md); for the fork's changes relative to upstream Tremor see [src/tremor/CHANGES.md](src/tremor/CHANGES.md).
 
 [![A project from the Open Home Foundation](https://www.openhomefoundation.org/badges/ohf-project.png)](https://www.openhomefoundation.org/)
 
@@ -215,7 +215,7 @@ Heap use depends heavily on the encoded file: sample rate, channel count, and th
 
 | Allocation | Size | Notes |
 | ---------- | ---- | ----- |
-| `Decoder state` | ~10-40KB | Tremor state: PCM history and decode/setup arenas. ~10KB mono/low-rate, ~40KB 48kHz stereo, more for multichannel; scales with block size and channels (PCM history dominates) |
+| `Decoder state` | ~7-51KB | Tremor state: block/setup decode arenas, including the per-channel synthesis buffers (blocksize/2 + blocksize/4 int32 per channel). ~6.7KB mono, ~13.1KB 44.1/48kHz stereo, ~51.3KB 7.1; scales with block size and channels |
 | `Demuxer buffers` | ~5-10KB typical | Ogg packet assembly (zero-copy when possible); starts at 1KB, grows on demand to a 128KB cap |
 | `Codebook tables` | ~5-20KB typical | Compact Huffman decode trees and quantized value arrays; scales with codebook complexity. Placed separately via `MICRO_VORBIS_CODEBOOK_MEMORY_PREFERENCE` |
 | `Output buffer` | User-provided | Typically 2-8KB for stereo |

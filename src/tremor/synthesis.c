@@ -23,6 +23,7 @@
 #include "registry.h"
 #include "misc.h"
 #include "block.h"
+#include "mdct.h"
 
 static int _vorbis_synthesis1(vorbis_block *vb,ogg_packet *op,int decodep){
   vorbis_dsp_state     *vd= vb ? vb->vd : 0;
@@ -49,7 +50,11 @@ static int _vorbis_synthesis1(vorbis_block *vb,ogg_packet *op,int decodep){
   /* read our mode and pre/post windowsize */
   mode=oggpack_read(opb,b->modebits);
   if(mode==-1)return(OV_EBADPACKET);
-  
+  /* modebits (ilog(modes)) can encode values >= a non-power-of-two mode
+     count, and mode_param is allocated to exactly ci->modes entries, so the
+     packet-supplied index must be bounded before any table access */
+  if(mode>=ci->modes)return(OV_EBADPACKET);
+
   vb->mode=mode;
   if(!ci->mode_param[mode]){
     return(OV_EBADPACKET);
@@ -71,21 +76,30 @@ static int _vorbis_synthesis1(vorbis_block *vb,ogg_packet *op,int decodep){
   vb->eofflag=op->e_o_s;
 
   if(decodep){
-    /* alloc pcm passback storage */
     vb->pcmend=ci->blocksizes[vb->W];
-    vb->pcm=(ogg_int32_t **)_vorbis_block_alloc(vb,sizeof(*vb->pcm)*vi->channels);
-    for(i=0;i<vi->channels;i++)
-      vb->pcm[i]=(ogg_int32_t *)_vorbis_block_alloc(vb,vb->pcmend*sizeof(*vb->pcm[i]));
-    
+
+    /* Save the previous block's iMDCT tail into vd->mdctright before
+       mapping_inverse overwrites vd->work with this block's spectrum. vd->W
+       still holds the PREVIOUS block's flag here (vorbis_synthesis_blockin
+       updates lW/W only after this returns), so blocksizes[vd->W] is the
+       size of the block whose half-transform is currently sitting in
+       vd->work. This must run after every header-parse OV_EBADPACKET check
+       above (a bad packet must not advance lap state) and before the
+       mapping inverse (which overwrites vd->work). Dropped channels have no
+       mdctright buffer and are never decoded, so they're skipped. */
+    for(i=0;i<vi->channels;i++){
+      if(vd->channel_keep && !vorbis_keep_get(vd->channel_keep,i))continue;
+      mdct_shift_right(ci->blocksizes[vd->W],vd->work[i],vd->mdctright[i]);
+    }
+
     /* unpack_header enforces range checking */
     type=ci->map_type[ci->mode_param[mode]->mapping];
-    
+
     return(_mapping_P[type]->inverse(vb,b->mode[mode]));
   }else{
-    /* no pcm */
+    /* no pcm; trackonly still exposes pcmend==0 as the decode-happened flag */
     vb->pcmend=0;
-    vb->pcm=NULL;
-    
+
     return(0);
   }
 }
@@ -124,7 +138,9 @@ long vorbis_packet_blocksize(vorbis_info *vi,ogg_packet *op){
     /* read our mode and pre/post windowsize */
     mode=oggpack_read(&opb,modebits);
   }
-  if(mode==-1 || !ci->mode_param[mode])return(OV_EBADPACKET);
+  /* bound the packet-supplied index before indexing mode_param, which is
+     allocated to exactly ci->modes entries */
+  if(mode==-1 || mode>=ci->modes || !ci->mode_param[mode])return(OV_EBADPACKET);
   return(ci->blocksizes[ci->mode_param[mode]->blockflag]);
 }
 
