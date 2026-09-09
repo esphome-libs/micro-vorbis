@@ -830,8 +830,8 @@ static bool test_out_of_range_mode_rejected() {
 
     CHECK(!out.errored);
     CHECK(out.header_ready);
-    CHECK_EQ(out.sample_rate, 8000u);
-    CHECK_EQ(out.channels, 1u);
+    CHECK_EQ(out.sample_rate, 8000);
+    CHECK_EQ(out.channels, 1);
     CHECK(out.eos);
     // The two valid packets produce one 256-sample block overlap: 128 samples.
     CHECK_EQ(out.pcm.size(), static_cast<size_t>(128));
