@@ -396,7 +396,7 @@ static void *floor1_inverse1(vorbis_block *vb,vorbis_look_floor *in){
       j+=cdim;
     }
 
-    /* unwrap positive values and reconsitute via linear interpolation */
+    /* unwrap positive values and reconstitute via linear interpolation */
     for(i=2;i<info->posts;i++){
       int predicted=render_point(info->postlist[info->loneighbor[i-2]],
 				 info->postlist[info->hineighbor[i-2]],

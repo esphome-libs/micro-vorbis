@@ -451,7 +451,7 @@ void mdct_unroll_lap(int n0,int n1,
   int postLap=(!lW && W ? (n1>>2)-(n0>>2) : 0 );
   int n,off;
 
-  /* preceeding direct-copy lapping from previous frame, if any */
+  /* preceding direct-copy lapping from previous frame, if any */
   if(preLap){
     n      = (end<preLap?end:preLap);
     off    = (start<preLap?start:preLap);
@@ -498,7 +498,9 @@ void mdct_unroll_lap(int n0,int n1,
     l+=2;
   }
 
-  /* preceeding direct-copy lapping from previous frame, if any */
+  /* trailing direct-copy region of this frame's own block, if any: the
+     long block extends past the short previous block's overlap, so these
+     samples have no lap partner and take no window */
   if(postLap){
     n      = (end<postLap?end:postLap);
     off    = (start<postLap?start:postLap);
